@@ -11,10 +11,9 @@ from jose import JWTError, jwt
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 
-from config.settings import get_settings
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

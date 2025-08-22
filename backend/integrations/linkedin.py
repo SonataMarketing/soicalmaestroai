@@ -1,126 +1,196 @@
 """
 LinkedIn API Integration
-Real API integration using LinkedIn Marketing API for posting and analytics
+LinkedIn API integration for professional content posting and company page management
 """
 
+import requests
 import logging
-import asyncio
-from datetime import datetime
-from typing import Dict, List, Optional
-import aiohttp
-import json
-from urllib.parse import urlencode
-
-from config.settings import get_settings
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 class LinkedInAPI:
-    """LinkedIn API client"""
+    """LinkedIn API integration for professional social media management"""
 
     def __init__(self):
         self.client_id = settings.linkedin_client_id
         self.client_secret = settings.linkedin_client_secret
-        self.access_token = settings.linkedin_access_token
+        self.redirect_uri = settings.linkedin_redirect_uri
         self.base_url = "https://api.linkedin.com/v2"
 
-        # User profile info (will be populated after initialization)
-        self.user_id = None
-        self.user_info = {}
+    def is_configured(self) -> bool:
+        """Check if LinkedIn API is properly configured"""
+        return bool(self.client_id and self.client_secret)
 
-    async def get_auth_url(self, redirect_uri: str, state: str = None) -> str:
-        """Generate LinkedIn authorization URL"""
-        params = {
-            "response_type": "code",
-            "client_id": self.client_id,
-            "redirect_uri": redirect_uri,
-            "state": state or "linkedin_auth",
-            "scope": "r_liteprofile r_emailaddress w_member_social"
+    def get_authorization_url(self, state: str = None) -> Dict:
+        """Get LinkedIn OAuth authorization URL"""
+
+        if not self.is_configured():
+            return {"error": "LinkedIn API not configured"}
+
+        # LinkedIn OAuth scopes
+        scopes = [
+            "r_liteprofile",
+            "r_emailaddress",
+            "w_member_social",
+            "r_organization_social",
+            "w_organization_social"
+        ]
+
+        auth_url = (
+            f"https://www.linkedin.com/oauth/v2/authorization"
+            f"?response_type=code"
+            f"&client_id={self.client_id}"
+            f"&redirect_uri={self.redirect_uri}"
+            f"&scope={' '.join(scopes)}"
+        )
+
+        if state:
+            auth_url += f"&state={state}"
+
+        return {
+            "authorization_url": auth_url,
+            "redirect_uri": self.redirect_uri,
+            "scopes": scopes
         }
 
-        auth_url = f"https://www.linkedin.com/oauth/v2/authorization?{urlencode(params)}"
-        return auth_url
-
-    async def exchange_code_for_token(self, code: str, redirect_uri: str) -> Dict:
+    def exchange_code_for_token(self, authorization_code: str) -> Dict:
         """Exchange authorization code for access token"""
+
+        if not self.is_configured():
+            return {"error": "LinkedIn API not configured"}
+
         try:
+            token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+
             data = {
                 "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
+                "code": authorization_code,
+                "redirect_uri": self.redirect_uri,
                 "client_id": self.client_id,
                 "client_secret": self.client_secret
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://www.linkedin.com/oauth/v2/accessToken",
-                    data=data,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        return {
-                            "access_token": result["access_token"],
-                            "token_type": result["token_type"],
-                            "expires_in": result["expires_in"],
-                            "scope": result.get("scope", "")
-                        }
-                    else:
-                        logger.error(f"Failed to exchange code for token: {result}")
-                        return {"error": result}
-
-        except Exception as e:
-            logger.error(f"Error exchanging code for token: {e}")
-            return {"error": str(e)}
-
-    async def get_user_profile(self, access_token: str = None) -> Dict:
-        """Get user profile information"""
-        token = access_token or self.access_token
-
-        if not token:
-            return {"error": "No access token available"}
-
-        try:
             headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/x-www-form-urlencoded"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/people/~",
-                    headers=headers
-                ) as response:
-                    result = await response.json()
+            response = requests.post(token_url, data=data, headers=headers)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        self.user_id = result.get("id")
-                        self.user_info = result
-                        return result
-                    else:
-                        logger.error(f"Failed to get user profile: {result}")
-                        return {"error": result}
+            token_data = response.json()
+            access_token = token_data.get("access_token")
 
-        except Exception as e:
-            logger.error(f"Error getting user profile: {e}")
-            return {"error": str(e)}
+            if not access_token:
+                return {"error": "Failed to get access token"}
 
-    async def post_text(self, text: str) -> Dict:
-        """Post text-only update to LinkedIn"""
+            # Get user profile information
+            user_info = self.get_user_profile(access_token)
+
+            return {
+                "access_token": access_token,
+                "expires_in": token_data.get("expires_in", 5184000),  # Default 60 days
+                "user_info": user_info,
+                "token_type": "Bearer"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn token exchange error: {str(e)}")
+            return {"error": f"Token exchange failed: {str(e)}"}
+
+    def get_user_profile(self, access_token: str) -> Dict:
+        """Get LinkedIn user profile information"""
+
         try:
-            if not self.access_token:
-                return {"error": "LinkedIn not configured", "success": False}
+            url = f"{self.base_url}/people/~"
 
-            if not self.user_id:
-                profile = await self.get_user_profile()
-                if "error" in profile:
-                    return {"error": "Failed to get user profile", "success": False}
+            params = {
+                "projection": "(id,firstName,lastName,profilePicture(displayImage~:playableStreams))"
+            }
 
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # Also get email address
+            email_url = f"{self.base_url}/emailAddress"
+            email_params = {"q": "members", "projection": "(elements*(handle~))"}
+            email_response = requests.get(email_url, params=email_params, headers=headers)
+
+            email_data = {}
+            if email_response.status_code == 200:
+                email_data = email_response.json()
+
+            # Extract email if available
+            email = None
+            if "elements" in email_data and email_data["elements"]:
+                email = email_data["elements"][0].get("handle~", {}).get("emailAddress")
+
+            return {
+                "id": data.get("id"),
+                "first_name": data.get("firstName", {}).get("localized", {}).get("en_US", ""),
+                "last_name": data.get("lastName", {}).get("localized", {}).get("en_US", ""),
+                "email": email,
+                "profile_picture": self._extract_profile_picture(data)
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn profile error: {str(e)}")
+            return {"error": f"Failed to get profile: {str(e)}"}
+
+    def _extract_profile_picture(self, profile_data: Dict) -> Optional[str]:
+        """Extract profile picture URL from LinkedIn API response"""
+
+        try:
+            profile_picture = profile_data.get("profilePicture", {})
+            display_image = profile_picture.get("displayImage~", {})
+            elements = display_image.get("elements", [])
+
+            if elements:
+                # Get the largest image
+                largest_image = max(elements, key=lambda x: x.get("data", {}).get("com.linkedin.digitalmedia.mediaartifact.StillImage", {}).get("storageSize", {}).get("width", 0))
+                identifiers = largest_image.get("identifiers", [])
+                if identifiers:
+                    return identifiers[0].get("identifier")
+
+            return None
+
+        except Exception:
+            return None
+
+    def post_to_profile(
+        self,
+        access_token: str,
+        text: str,
+        image_url: str = None,
+        article_url: str = None
+    ) -> Dict:
+        """Post text content to LinkedIn profile"""
+
+        try:
+            url = f"{self.base_url}/ugcPosts"
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0"
+            }
+
+            # Get person URN
+            person_urn = self._get_person_urn(access_token)
+            if not person_urn:
+                return {"error": "Failed to get person URN"}
+
+            # Build post data
             post_data = {
-                "author": f"urn:li:person:{self.user_id}",
+                "author": person_urn,
                 "lifecycleState": "PUBLISHED",
                 "specificContent": {
                     "com.linkedin.ugc.ShareContent": {
@@ -135,128 +205,82 @@ class LinkedInAPI:
                 }
             }
 
-            headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json",
-                "X-Restli-Protocol-Version": "2.0.0"
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/ugcPosts",
-                    json=post_data,
-                    headers=headers
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 201:
-                        post_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": post_id,
-                            "post_url": f"https://www.linkedin.com/feed/update/{post_id}/" if post_id else None
+            # Add media if provided
+            if image_url:
+                media_urn = self._upload_image(access_token, image_url, person_urn)
+                if media_urn:
+                    post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = "IMAGE"
+                    post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+                        {
+                            "status": "READY",
+                            "description": {
+                                "text": "Image"
+                            },
+                            "media": media_urn
                         }
-                    else:
-                        logger.error(f"Failed to post to LinkedIn: {result}")
-                        return {"error": result, "success": False}
+                    ]
 
-        except Exception as e:
-            logger.error(f"Error posting to LinkedIn: {e}")
-            return {"error": str(e), "success": False}
-
-    async def post_with_media(self, text: str, media_url: str) -> Dict:
-        """Post update with media to LinkedIn"""
-        try:
-            if not self.access_token:
-                return {"error": "LinkedIn not configured", "success": False}
-
-            if not self.user_id:
-                profile = await self.get_user_profile()
-                if "error" in profile:
-                    return {"error": "Failed to get user profile", "success": False}
-
-            # First, upload the media
-            media_urn = await self._upload_media(media_url)
-
-            if not media_urn:
-                return {"error": "Failed to upload media", "success": False}
-
-            post_data = {
-                "author": f"urn:li:person:{self.user_id}",
-                "lifecycleState": "PUBLISHED",
-                "specificContent": {
-                    "com.linkedin.ugc.ShareContent": {
-                        "shareCommentary": {
-                            "text": text
-                        },
-                        "shareMediaCategory": "IMAGE",  # or VIDEO based on media type
-                        "media": [
-                            {
-                                "status": "READY",
-                                "description": {
-                                    "text": "Media shared via AI Social Manager"
-                                },
-                                "media": media_urn,
-                                "title": {
-                                    "text": "AI Generated Content"
-                                }
-                            }
-                        ]
+            # Add article link if provided
+            if article_url:
+                post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = "ARTICLE"
+                post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+                    {
+                        "status": "READY",
+                        "originalUrl": article_url
                     }
-                },
-                "visibility": {
-                    "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-                }
+                ]
+
+            response = requests.post(url, json=post_data, headers=headers)
+            response.raise_for_status()
+
+            result = response.json()
+
+            return {
+                "success": True,
+                "post_id": result.get("id"),
+                "message": "Post published successfully to LinkedIn"
             }
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn post error: {str(e)}")
+            return {"error": f"Failed to post to LinkedIn: {str(e)}"}
+
+    def _get_person_urn(self, access_token: str) -> Optional[str]:
+        """Get person URN for posting"""
+
+        try:
+            url = f"{self.base_url}/people/~"
 
             headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json",
-                "X-Restli-Protocol-Version": "2.0.0"
+                "Authorization": f"Bearer {access_token}"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/ugcPosts",
-                    json=post_data,
-                    headers=headers
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
 
-                    if response.status == 201:
-                        post_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": post_id,
-                            "post_url": f"https://www.linkedin.com/feed/update/{post_id}/" if post_id else None,
-                            "media_urn": media_urn
-                        }
-                    else:
-                        logger.error(f"Failed to post with media to LinkedIn: {result}")
-                        return {"error": result, "success": False}
+            data = response.json()
+            person_id = data.get("id")
+
+            if person_id:
+                return f"urn:li:person:{person_id}"
+
+            return None
 
         except Exception as e:
-            logger.error(f"Error posting with media to LinkedIn: {e}")
-            return {"error": str(e), "success": False}
+            logger.error(f"Error getting person URN: {str(e)}")
+            return None
 
-    async def _upload_media(self, media_url: str) -> Optional[str]:
-        """Upload media to LinkedIn and return media URN"""
+    def _upload_image(self, access_token: str, image_url: str, person_urn: str) -> Optional[str]:
+        """Upload image to LinkedIn for use in posts"""
+
         try:
-            # Download media from URL
-            async with aiohttp.ClientSession() as session:
-                async with session.get(media_url) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to download media from {media_url}")
-                        return None
+            # Step 1: Register upload
+            register_url = f"{self.base_url}/assets"
 
-                    media_data = await response.read()
-                    content_type = response.headers.get('content-type', '')
-
-            # Register upload
-            upload_request = {
+            register_data = {
                 "registerUploadRequest": {
                     "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
-                    "owner": f"urn:li:person:{self.user_id}",
+                    "owner": person_urn,
                     "serviceRelationships": [
                         {
                             "relationshipType": "OWNER",
@@ -267,229 +291,380 @@ class LinkedInAPI:
             }
 
             headers = {
-                "Authorization": f"Bearer {self.access_token}",
+                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
 
-            async with aiohttp.ClientSession() as session:
-                # Register upload
-                async with session.post(
-                    f"{self.base_url}/assets?action=registerUpload",
-                    json=upload_request,
-                    headers=headers
-                ) as response:
-                    register_result = await response.json()
+            register_response = requests.post(register_url, json=register_data, headers=headers)
+            register_response.raise_for_status()
 
-                    if response.status != 200:
-                        logger.error(f"Failed to register upload: {register_result}")
-                        return None
+            register_result = register_response.json()
+            upload_mechanism = register_result.get("value", {}).get("uploadMechanism", {})
+            upload_url = upload_mechanism.get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {}).get("uploadUrl")
+            asset_urn = register_result.get("value", {}).get("asset")
 
-                    upload_url = register_result["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
-                    asset_id = register_result["value"]["asset"]
+            if not upload_url or not asset_urn:
+                return None
 
-                # Upload media
-                upload_headers = {
-                    "Authorization": f"Bearer {self.access_token}"
-                }
+            # Step 2: Download image
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
 
-                async with session.put(
-                    upload_url,
-                    data=media_data,
-                    headers=upload_headers
-                ) as upload_response:
-                    if upload_response.status not in [200, 201]:
-                        logger.error(f"Failed to upload media: {upload_response.status}")
-                        return None
+            # Step 3: Upload image
+            upload_headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
 
-                    return asset_id
+            upload_response = requests.post(
+                upload_url,
+                data=image_response.content,
+                headers=upload_headers
+            )
+            upload_response.raise_for_status()
+
+            return asset_urn
 
         except Exception as e:
-            logger.error(f"Error uploading media to LinkedIn: {e}")
+            logger.error(f"LinkedIn image upload error: {str(e)}")
             return None
 
-    async def get_user_posts(self, limit: int = 10) -> List[Dict]:
-        """Get user's recent posts"""
+    def get_profile_posts(self, access_token: str, count: int = 20) -> Dict:
+        """Get user's LinkedIn posts"""
+
         try:
-            if not self.access_token or not self.user_id:
-                return []
+            person_urn = self._get_person_urn(access_token)
+            if not person_urn:
+                return {"error": "Failed to get person URN"}
+
+            url = f"{self.base_url}/ugcPosts"
 
             params = {
                 "q": "authors",
-                "authors": f"urn:li:person:{self.user_id}",
-                "count": limit,
-                "sortBy": "LAST_MODIFIED"
+                "authors": person_urn,
+                "count": count,
+                "projection": "(id,author,created,specificContent,ugcPostAnalytics)"
             }
 
             headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {access_token}"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/ugcPosts",
-                    params=params,
-                    headers=headers
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        posts = []
-                        for post in result.get("elements", []):
-                            post_data = {
-                                "id": post.get("id"),
-                                "text": post.get("specificContent", {}).get("com.linkedin.ugc.ShareContent", {}).get("shareCommentary", {}).get("text", ""),
-                                "created_time": post.get("created", {}).get("time"),
-                                "last_modified": post.get("lastModified", {}).get("time"),
-                                "lifecycle_state": post.get("lifecycleState"),
-                                "url": f"https://www.linkedin.com/feed/update/{post.get('id')}/" if post.get('id') else None
-                            }
-                            posts.append(post_data)
+            data = response.json()
+            posts = []
 
-                        return posts
-                    else:
-                        logger.error(f"Failed to get user posts: {result}")
-                        return []
+            for post in data.get("elements", []):
+                post_data = {
+                    "id": post.get("id"),
+                    "created": post.get("created", {}).get("time"),
+                    "text": self._extract_post_text(post),
+                    "analytics": post.get("ugcPostAnalytics", {})
+                }
+                posts.append(post_data)
 
-        except Exception as e:
-            logger.error(f"Error getting user posts: {e}")
+            return {"success": True, "posts": posts}
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn posts error: {str(e)}")
+            return {"error": f"Failed to get posts: {str(e)}"}
+
+    def _extract_post_text(self, post_data: Dict) -> str:
+        """Extract text content from LinkedIn post"""
+
+        try:
+            specific_content = post_data.get("specificContent", {})
+            share_content = specific_content.get("com.linkedin.ugc.ShareContent", {})
+            share_commentary = share_content.get("shareCommentary", {})
+            return share_commentary.get("text", "")
+        except Exception:
+            return ""
+
+    def get_company_pages(self, access_token: str) -> List[Dict]:
+        """Get company pages that user can manage"""
+
+        try:
+            url = f"{self.base_url}/organizationAcls"
+
+            params = {
+                "q": "roleAssignee",
+                "projection": "(elements*(organization~(id,name,logoV2),roleAssignee,role))"
+            }
+
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+            companies = []
+
+            for element in data.get("elements", []):
+                organization = element.get("organization~", {})
+                role = element.get("role")
+
+                if role in ["ADMINISTRATOR", "DIRECT_SPONSORED_CONTENT_POSTER"]:
+                    companies.append({
+                        "id": organization.get("id"),
+                        "name": organization.get("name", {}).get("localized", {}).get("en_US", ""),
+                        "role": role,
+                        "logo": self._extract_company_logo(organization)
+                    })
+
+            return companies
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn company pages error: {str(e)}")
             return []
 
-    async def get_post_analytics(self, post_id: str) -> Dict:
-        """Get analytics for a specific post"""
+    def _extract_company_logo(self, organization_data: Dict) -> Optional[str]:
+        """Extract company logo URL from organization data"""
+
         try:
-            if not self.access_token:
-                return {}
+            logo_v2 = organization_data.get("logoV2", {})
+            cropped_image = logo_v2.get("cropped~", {})
+            elements = cropped_image.get("elements", [])
+
+            if elements:
+                # Get the largest image
+                largest_image = max(elements, key=lambda x: x.get("data", {}).get("com.linkedin.digitalmedia.mediaartifact.StillImage", {}).get("storageSize", {}).get("width", 0))
+                identifiers = largest_image.get("identifiers", [])
+                if identifiers:
+                    return identifiers[0].get("identifier")
+
+            return None
+
+        except Exception:
+            return None
+
+    def post_to_company_page(
+        self,
+        access_token: str,
+        company_id: str,
+        text: str,
+        image_url: str = None
+    ) -> Dict:
+        """Post content to LinkedIn company page"""
+
+        try:
+            url = f"{self.base_url}/ugcPosts"
 
             headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0"
             }
 
-            # Note: LinkedIn analytics API requires special permissions
-            # This is a simplified version
-            params = {
-                "q": "ugcPost",
-                "ugcPost": post_id
+            company_urn = f"urn:li:organization:{company_id}"
+
+            # Build post data
+            post_data = {
+                "author": company_urn,
+                "lifecycleState": "PUBLISHED",
+                "specificContent": {
+                    "com.linkedin.ugc.ShareContent": {
+                        "shareCommentary": {
+                            "text": text
+                        },
+                        "shareMediaCategory": "NONE"
+                    }
+                },
+                "visibility": {
+                    "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+                }
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/socialActions",
-                    params=params,
-                    headers=headers
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        # Process analytics data
-                        analytics = {
-                            "post_id": post_id,
-                            "likes": 0,
-                            "comments": 0,
-                            "shares": 0,
-                            "impressions": 0
+            # Add image if provided
+            if image_url:
+                media_urn = self._upload_image_for_company(access_token, image_url, company_urn)
+                if media_urn:
+                    post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = "IMAGE"
+                    post_data["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+                        {
+                            "status": "READY",
+                            "description": {
+                                "text": "Image"
+                            },
+                            "media": media_urn
                         }
+                    ]
 
-                        # Parse LinkedIn analytics response
-                        # This would need to be implemented based on actual API response structure
+            response = requests.post(url, json=post_data, headers=headers)
+            response.raise_for_status()
 
-                        return analytics
-                    else:
-                        logger.error(f"Failed to get post analytics: {result}")
-                        return {}
+            result = response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting post analytics: {e}")
-            return {}
+            return {
+                "success": True,
+                "post_id": result.get("id"),
+                "message": "Post published successfully to LinkedIn company page"
+            }
 
-    async def search_content(self, keywords: List[str], limit: int = 20) -> List[Dict]:
-        """Search for content on LinkedIn (limited by API access)"""
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn company post error: {str(e)}")
+            return {"error": f"Failed to post to LinkedIn company page: {str(e)}"}
+
+    def _upload_image_for_company(self, access_token: str, image_url: str, company_urn: str) -> Optional[str]:
+        """Upload image for company page posts"""
+
         try:
-            # Note: LinkedIn's search API is very limited for third-party apps
-            # This is a placeholder implementation
+            # Step 1: Register upload for company
+            register_url = f"{self.base_url}/assets"
 
-            content = []
-
-            # In a real implementation, you might:
-            # 1. Use LinkedIn's Company Pages API to get content from specific companies
-            # 2. Use the Professional Community API if available
-            # 3. Implement web scraping (with caution regarding terms of service)
-
-            logger.info(f"LinkedIn content search not fully implemented for keywords: {keywords}")
-
-            return content
-
-        except Exception as e:
-            logger.error(f"Error searching LinkedIn content: {e}")
-            return []
-
-    async def get_user_connections(self, limit: int = 100) -> List[Dict]:
-        """Get user connections (requires additional permissions)"""
-        try:
-            if not self.access_token:
-                return []
+            register_data = {
+                "registerUploadRequest": {
+                    "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                    "owner": company_urn,
+                    "serviceRelationships": [
+                        {
+                            "relationshipType": "OWNER",
+                            "identifier": "urn:li:userGeneratedContent"
+                        }
+                    ]
+                }
+            }
 
             headers = {
-                "Authorization": f"Bearer {self.access_token}",
+                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
 
-            params = {
-                "count": limit,
-                "start": 0
+            register_response = requests.post(register_url, json=register_data, headers=headers)
+            register_response.raise_for_status()
+
+            register_result = register_response.json()
+            upload_mechanism = register_result.get("value", {}).get("uploadMechanism", {})
+            upload_url = upload_mechanism.get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {}).get("uploadUrl")
+            asset_urn = register_result.get("value", {}).get("asset")
+
+            if not upload_url or not asset_urn:
+                return None
+
+            # Step 2: Download and upload image
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
+
+            upload_headers = {
+                "Authorization": f"Bearer {access_token}"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/people/~/connections",
-                    params=params,
-                    headers=headers
-                ) as response:
-                    result = await response.json()
+            upload_response = requests.post(
+                upload_url,
+                data=image_response.content,
+                headers=upload_headers
+            )
+            upload_response.raise_for_status()
 
-                    if response.status == 200:
-                        connections = []
-                        for connection in result.get("values", []):
-                            connection_data = {
-                                "id": connection.get("id"),
-                                "first_name": connection.get("firstName"),
-                                "last_name": connection.get("lastName"),
-                                "headline": connection.get("headline"),
-                                "industry": connection.get("industry"),
-                                "location": connection.get("location", {}).get("name"),
-                                "profile_url": connection.get("publicProfileUrl")
-                            }
-                            connections.append(connection_data)
-
-                        return connections
-                    else:
-                        logger.error(f"Failed to get connections: {result}")
-                        return []
+            return asset_urn
 
         except Exception as e:
-            logger.error(f"Error getting connections: {e}")
-            return []
+            logger.error(f"LinkedIn company image upload error: {str(e)}")
+            return None
 
-    async def discover_trending_content(self, keywords: List[str], limit: int = 50) -> List[Dict]:
-        """Discover trending content based on keywords"""
-        # LinkedIn's API is quite restrictive for content discovery
-        # This would typically require:
-        # 1. Company pages API access
-        # 2. Professional community API access
-        # 3. Or web scraping (with proper rate limiting and ToS compliance)
+    def get_post_analytics(self, access_token: str, post_id: str) -> Dict:
+        """Get analytics for a specific LinkedIn post"""
 
-        trending_content = []
+        try:
+            url = f"{self.base_url}/ugcPostAnalytics/{post_id}"
 
-        logger.info(f"LinkedIn trending content discovery limited by API access for keywords: {keywords}")
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
 
-        # Placeholder implementation - in production you might integrate with:
-        # - LinkedIn Sales Navigator API (if available)
-        # - Company pages you have access to
-        # - Public posts from your network
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
 
-        return trending_content[:limit]
+            return {"success": True, "analytics": response.json()}
 
-    def is_configured(self) -> bool:
-        """Check if LinkedIn API is properly configured"""
-        return bool(self.client_id and self.client_secret and self.access_token)
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn post analytics error: {str(e)}")
+            return {"error": f"Failed to get post analytics: {str(e)}"}
+
+    def delete_post(self, access_token: str, post_id: str) -> Dict:
+        """Delete a LinkedIn post"""
+
+        try:
+            url = f"{self.base_url}/ugcPosts/{post_id}"
+
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            response = requests.delete(url, headers=headers)
+            response.raise_for_status()
+
+            return {
+                "success": True,
+                "post_id": post_id,
+                "message": "Post deleted successfully"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn delete error: {str(e)}")
+            return {"error": f"Failed to delete post: {str(e)}"}
+
+    def validate_token(self, access_token: str) -> Dict:
+        """Validate LinkedIn access token"""
+
+        try:
+            profile_info = self.get_user_profile(access_token)
+
+            if "error" in profile_info:
+                return {"valid": False, "error": profile_info["error"]}
+
+            companies = self.get_company_pages(access_token)
+
+            return {
+                "valid": True,
+                "user_id": profile_info.get("id"),
+                "user_name": f"{profile_info.get('first_name', '')} {profile_info.get('last_name', '')}".strip(),
+                "company_pages_count": len(companies)
+            }
+
+        except Exception as e:
+            return {"valid": False, "error": str(e)}
+
+    def search_companies(self, access_token: str, query: str) -> Dict:
+        """Search for companies on LinkedIn"""
+
+        try:
+            url = f"{self.base_url}/companySearch"
+
+            params = {
+                "keywords": query,
+                "facet": "network",
+                "facetNetwork": ["F"],
+                "count": 10
+            }
+
+            headers = {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+            companies = []
+
+            for company in data.get("companies", {}).get("values", []):
+                companies.append({
+                    "id": company.get("id"),
+                    "name": company.get("name"),
+                    "description": company.get("description"),
+                    "industry": company.get("industries", {}).get("values", [{}])[0].get("name") if company.get("industries") else None,
+                    "size": company.get("size"),
+                    "website": company.get("websiteUrl")
+                })
+
+            return {"success": True, "companies": companies}
+
+        except requests.RequestException as e:
+            logger.error(f"LinkedIn company search error: {str(e)}")
+            return {"error": f"Failed to search companies: {str(e)}"}
+
+# Global instance
+linkedin_api = LinkedInAPI()

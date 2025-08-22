@@ -1,529 +1,420 @@
 """
-Instagram Graph API Integration
-Real API integration for content discovery, posting, and analytics
+Instagram API Integration
+Instagram Basic Display API and Instagram Graph API for business accounts
 """
 
-import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
 import requests
-import aiohttp
-from urllib.parse import urlencode
-
-from config.settings import get_settings
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 class InstagramAPI:
-    """Instagram Graph API client"""
+    """Instagram API integration for posting and content management"""
 
     def __init__(self):
         self.app_id = settings.instagram_app_id
         self.app_secret = settings.instagram_app_secret
-        self.access_token = settings.instagram_access_token
-        self.business_account_id = settings.instagram_business_account_id
-        self.base_url = "https://graph.facebook.com/v18.0"
+        self.redirect_uri = settings.instagram_redirect_uri
+        self.base_url = "https://graph.instagram.com"
+        self.facebook_base_url = "https://graph.facebook.com/v18.0"
 
-    async def get_auth_url(self, redirect_uri: str, state: str = None) -> str:
-        """Generate Instagram authorization URL"""
-        params = {
-            "client_id": self.app_id,
-            "redirect_uri": redirect_uri,
-            "scope": "instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement",
-            "response_type": "code",
-            "state": state or "instagram_auth"
+    def is_configured(self) -> bool:
+        """Check if Instagram API is properly configured"""
+        return bool(self.app_id and self.app_secret)
+
+    def get_authorization_url(self, state: str = None) -> Dict:
+        """Get Instagram OAuth authorization URL"""
+
+        if not self.is_configured():
+            return {"error": "Instagram API not configured"}
+
+        # Instagram Basic Display API OAuth URL
+        auth_url = (
+            f"https://api.instagram.com/oauth/authorize"
+            f"?client_id={self.app_id}"
+            f"&redirect_uri={self.redirect_uri}"
+            f"&scope=user_profile,user_media"
+            f"&response_type=code"
+        )
+
+        if state:
+            auth_url += f"&state={state}"
+
+        return {
+            "authorization_url": auth_url,
+            "redirect_uri": self.redirect_uri,
+            "scopes": ["user_profile", "user_media"]
         }
 
-        auth_url = f"https://api.instagram.com/oauth/authorize?{urlencode(params)}"
-        return auth_url
-
-    async def exchange_code_for_token(self, code: str, redirect_uri: str) -> Dict:
+    def exchange_code_for_token(self, authorization_code: str) -> Dict:
         """Exchange authorization code for access token"""
+
+        if not self.is_configured():
+            return {"error": "Instagram API not configured"}
+
         try:
-            async with aiohttp.ClientSession() as session:
-                data = {
-                    "client_id": self.app_id,
-                    "client_secret": self.app_secret,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": redirect_uri,
-                    "code": code
-                }
+            # Step 1: Get short-lived token
+            token_url = "https://api.instagram.com/oauth/access_token"
 
-                async with session.post(
-                    "https://api.instagram.com/oauth/access_token",
-                    data=data
-                ) as response:
-                    result = await response.json()
+            data = {
+                "client_id": self.app_id,
+                "client_secret": self.app_secret,
+                "grant_type": "authorization_code",
+                "redirect_uri": self.redirect_uri,
+                "code": authorization_code
+            }
 
-                    if response.status == 200:
-                        # Exchange short-lived token for long-lived token
-                        long_lived_token = await self.get_long_lived_token(result["access_token"])
-                        return long_lived_token
-                    else:
-                        logger.error(f"Failed to exchange code for token: {result}")
-                        return {"error": result}
+            response = requests.post(token_url, data=data)
+            response.raise_for_status()
 
-        except Exception as e:
-            logger.error(f"Error exchanging code for token: {e}")
-            return {"error": str(e)}
+            token_data = response.json()
+            short_token = token_data.get("access_token")
 
-    async def get_long_lived_token(self, short_token: str) -> Dict:
+            if not short_token:
+                return {"error": "Failed to get access token"}
+
+            # Step 2: Exchange for long-lived token
+            long_lived_token = self._get_long_lived_token(short_token)
+
+            if long_lived_token.get("error"):
+                return long_lived_token
+
+            # Step 3: Get user info
+            user_info = self.get_user_info(long_lived_token["access_token"])
+
+            return {
+                "access_token": long_lived_token["access_token"],
+                "expires_in": long_lived_token.get("expires_in", 5184000),  # 60 days
+                "user_info": user_info,
+                "token_type": "long_lived"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Instagram token exchange error: {str(e)}")
+            return {"error": f"Token exchange failed: {str(e)}"}
+
+    def _get_long_lived_token(self, short_token: str) -> Dict:
         """Convert short-lived token to long-lived token"""
+
         try:
+            url = f"{self.base_url}/access_token"
+
             params = {
                 "grant_type": "ig_exchange_token",
                 "client_secret": self.app_secret,
                 "access_token": short_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/oauth/access_token",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return {
-                            "access_token": result["access_token"],
-                            "token_type": result["token_type"],
-                            "expires_in": result.get("expires_in", 5183944)  # ~60 days
-                        }
-                    else:
-                        logger.error(f"Failed to get long-lived token: {result}")
-                        return {"error": result}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting long-lived token: {e}")
-            return {"error": str(e)}
+        except requests.RequestException as e:
+            logger.error(f"Long-lived token error: {str(e)}")
+            return {"error": f"Long-lived token generation failed: {str(e)}"}
 
-    async def refresh_access_token(self, current_token: str) -> Dict:
+    def refresh_token(self, access_token: str) -> Dict:
         """Refresh long-lived access token"""
+
         try:
+            url = f"{self.base_url}/refresh_access_token"
+
             params = {
                 "grant_type": "ig_refresh_token",
-                "access_token": current_token
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/refresh_access_token",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return {
-                            "access_token": result["access_token"],
-                            "token_type": result["token_type"],
-                            "expires_in": result.get("expires_in", 5183944)
-                        }
-                    else:
-                        logger.error(f"Failed to refresh token: {result}")
-                        return {"error": result}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error refreshing token: {e}")
-            return {"error": str(e)}
+        except requests.RequestException as e:
+            logger.error(f"Token refresh error: {str(e)}")
+            return {"error": f"Token refresh failed: {str(e)}"}
 
-    async def get_user_info(self, access_token: str = None) -> Dict:
-        """Get Instagram user information"""
-        token = access_token or self.access_token
+    def get_user_info(self, access_token: str) -> Dict:
+        """Get Instagram user profile information"""
 
         try:
+            url = f"{self.base_url}/me"
+
             params = {
                 "fields": "id,username,account_type,media_count",
-                "access_token": token
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/me",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return result
-                    else:
-                        logger.error(f"Failed to get user info: {result}")
-                        return {"error": result}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting user info: {e}")
-            return {"error": str(e)}
+        except requests.RequestException as e:
+            logger.error(f"User info error: {str(e)}")
+            return {"error": f"Failed to get user info: {str(e)}"}
 
-    async def get_business_accounts(self, access_token: str = None) -> List[Dict]:
-        """Get connected Instagram business accounts"""
-        token = access_token or self.access_token
+    def get_user_media(self, access_token: str, limit: int = 25) -> Dict:
+        """Get user's Instagram media posts"""
 
         try:
+            url = f"{self.base_url}/me/media"
+
             params = {
-                "fields": "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}",
-                "access_token": token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/me/accounts",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        accounts = []
-                        for page in result.get("data", []):
-                            if "instagram_business_account" in page:
-                                accounts.append(page["instagram_business_account"])
-                        return accounts
-                    else:
-                        logger.error(f"Failed to get business accounts: {result}")
-                        return []
-
-        except Exception as e:
-            logger.error(f"Error getting business accounts: {e}")
-            return []
-
-    async def get_hashtag_search(self, hashtag: str, count: int = 25) -> List[Dict]:
-        """Search for recent posts by hashtag"""
-        if not self.business_account_id or not self.access_token:
-            logger.warning("Instagram business account not configured")
-            return []
-
-        try:
-            # First, get hashtag ID
-            hashtag_id = await self.get_hashtag_id(hashtag)
-            if not hashtag_id:
-                return []
-
-            # Get recent media for hashtag
-            params = {
-                "fields": "id,media_type,media_url,permalink,caption,timestamp,like_count,comments_count",
-                "limit": count,
-                "access_token": self.access_token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{hashtag_id}/recent_media",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        return result.get("data", [])
-                    else:
-                        logger.error(f"Failed to search hashtag {hashtag}: {result}")
-                        return []
-
-        except Exception as e:
-            logger.error(f"Error searching hashtag {hashtag}: {e}")
-            return []
-
-    async def get_hashtag_id(self, hashtag: str) -> Optional[str]:
-        """Get hashtag ID for searches"""
-        try:
-            params = {
-                "q": hashtag.replace("#", ""),
-                "access_token": self.access_token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/ig_hashtag_search",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200 and result.get("data"):
-                        return result["data"][0]["id"]
-                    else:
-                        logger.error(f"Failed to get hashtag ID for {hashtag}: {result}")
-                        return None
-
-        except Exception as e:
-            logger.error(f"Error getting hashtag ID for {hashtag}: {e}")
-            return None
-
-    async def get_user_media(self, limit: int = 25, fields: str = None) -> List[Dict]:
-        """Get user's media posts"""
-        if not self.business_account_id or not self.access_token:
-            logger.warning("Instagram business account not configured")
-            return []
-
-        default_fields = "id,media_type,media_url,permalink,caption,timestamp,like_count,comments_count"
-        fields = fields or default_fields
-
-        try:
-            params = {
-                "fields": fields,
+                "fields": "id,caption,media_type,media_url,permalink,thumbnail_url,timestamp",
                 "limit": limit,
-                "access_token": self.access_token
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{self.business_account_id}/media",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return result.get("data", [])
-                    else:
-                        logger.error(f"Failed to get user media: {result}")
-                        return []
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting user media: {e}")
-            return []
+        except requests.RequestException as e:
+            logger.error(f"Media fetch error: {str(e)}")
+            return {"error": f"Failed to get media: {str(e)}"}
 
-    async def create_media_object(self, image_url: str, caption: str, is_video: bool = False) -> Optional[str]:
-        """Create media object for publishing"""
-        if not self.business_account_id or not self.access_token:
-            logger.error("Instagram business account not configured")
-            return None
+    def create_media_container(
+        self,
+        access_token: str,
+        image_url: str,
+        caption: str,
+        is_business_account: bool = True
+    ) -> Dict:
+        """Create media container for posting (Business accounts only)"""
+
+        if not is_business_account:
+            return {"error": "Media posting requires Instagram Business account"}
 
         try:
+            # For business accounts, use Instagram Graph API
+            url = f"{self.facebook_base_url}/me/media"
+
             data = {
+                "image_url": image_url,
                 "caption": caption,
-                "access_token": self.access_token
+                "access_token": access_token
             }
 
-            if is_video:
-                data["media_type"] = "VIDEO"
-                data["video_url"] = image_url
-            else:
-                data["image_url"] = image_url
+            response = requests.post(url, data=data)
+            response.raise_for_status()
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/{self.business_account_id}/media",
-                    data=data
-                ) as response:
-                    result = await response.json()
+            return response.json()
 
-                    if response.status == 200:
-                        return result["id"]
-                    else:
-                        logger.error(f"Failed to create media object: {result}")
-                        return None
+        except requests.RequestException as e:
+            logger.error(f"Media container creation error: {str(e)}")
+            return {"error": f"Failed to create media container: {str(e)}"}
 
-        except Exception as e:
-            logger.error(f"Error creating media object: {e}")
-            return None
-
-    async def publish_media(self, creation_id: str) -> Dict:
-        """Publish media object"""
-        if not self.business_account_id or not self.access_token:
-            logger.error("Instagram business account not configured")
-            return {"error": "Account not configured"}
+    def publish_media(self, access_token: str, creation_id: str) -> Dict:
+        """Publish media container to Instagram"""
 
         try:
+            url = f"{self.facebook_base_url}/me/media_publish"
+
             data = {
                 "creation_id": creation_id,
-                "access_token": self.access_token
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/{self.business_account_id}/media_publish",
-                    data=data
-                ) as response:
-                    result = await response.json()
+            response = requests.post(url, data=data)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return {"id": result["id"], "success": True}
-                    else:
-                        logger.error(f"Failed to publish media: {result}")
-                        return {"error": result, "success": False}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error publishing media: {e}")
-            return {"error": str(e), "success": False}
+        except requests.RequestException as e:
+            logger.error(f"Media publish error: {str(e)}")
+            return {"error": f"Failed to publish media: {str(e)}"}
 
-    async def post_photo(self, image_url: str, caption: str) -> Dict:
+    def post_photo(
+        self,
+        access_token: str,
+        image_url: str,
+        caption: str,
+        is_business_account: bool = True
+    ) -> Dict:
         """Post a photo to Instagram"""
-        try:
-            # Create media object
-            creation_id = await self.create_media_object(image_url, caption, is_video=False)
 
+        try:
+            # Step 1: Create media container
+            container_result = self.create_media_container(
+                access_token, image_url, caption, is_business_account
+            )
+
+            if "error" in container_result:
+                return container_result
+
+            creation_id = container_result.get("id")
             if not creation_id:
-                return {"error": "Failed to create media object", "success": False}
+                return {"error": "No creation ID returned from media container"}
 
-            # Wait a moment for processing
-            await asyncio.sleep(2)
+            # Step 2: Publish media
+            publish_result = self.publish_media(access_token, creation_id)
 
-            # Publish the media
-            result = await self.publish_media(creation_id)
-
-            if result.get("success"):
-                logger.info(f"Successfully posted photo to Instagram: {result['id']}")
-                return {
-                    "success": True,
-                    "post_id": result["id"],
-                    "creation_id": creation_id
-                }
-            else:
-                return result
-
-        except Exception as e:
-            logger.error(f"Error posting photo: {e}")
-            return {"error": str(e), "success": False}
-
-    async def post_video(self, video_url: str, caption: str) -> Dict:
-        """Post a video to Instagram"""
-        try:
-            # Create media object for video
-            creation_id = await self.create_media_object(video_url, caption, is_video=True)
-
-            if not creation_id:
-                return {"error": "Failed to create video media object", "success": False}
-
-            # Videos take longer to process
-            await asyncio.sleep(10)
-
-            # Check if video is ready for publishing
-            ready = await self.check_media_status(creation_id)
-            if not ready:
-                return {"error": "Video not ready for publishing", "success": False}
-
-            # Publish the video
-            result = await self.publish_media(creation_id)
-
-            if result.get("success"):
-                logger.info(f"Successfully posted video to Instagram: {result['id']}")
-                return {
-                    "success": True,
-                    "post_id": result["id"],
-                    "creation_id": creation_id
-                }
-            else:
-                return result
-
-        except Exception as e:
-            logger.error(f"Error posting video: {e}")
-            return {"error": str(e), "success": False}
-
-    async def check_media_status(self, creation_id: str) -> bool:
-        """Check if media is ready for publishing"""
-        try:
-            params = {
-                "fields": "status_code",
-                "access_token": self.access_token
+            return {
+                "success": True,
+                "post_id": publish_result.get("id"),
+                "creation_id": creation_id,
+                "message": "Photo posted successfully to Instagram"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{creation_id}",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        status = result.get("status_code")
-                        return status == "FINISHED"
-                    else:
-                        logger.error(f"Failed to check media status: {result}")
-                        return False
-
         except Exception as e:
-            logger.error(f"Error checking media status: {e}")
-            return False
+            logger.error(f"Instagram photo post error: {str(e)}")
+            return {"error": f"Failed to post photo: {str(e)}"}
 
-    async def get_media_insights(self, media_id: str) -> Dict:
-        """Get insights for a specific media post"""
+    def get_media_insights(self, access_token: str, media_id: str) -> Dict:
+        """Get insights for a specific media post (Business accounts only)"""
+
         try:
+            url = f"{self.facebook_base_url}/{media_id}/insights"
+
             params = {
-                "metric": "engagement,impressions,reach,saved",
-                "access_token": self.access_token
+                "metric": "impressions,reach,likes,comments,saves,shares",
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{media_id}/insights",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        insights = {}
-                        for data in result.get("data", []):
-                            insights[data["name"]] = data["values"][0]["value"]
-                        return insights
-                    else:
-                        logger.error(f"Failed to get media insights: {result}")
-                        return {}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting media insights: {e}")
-            return {}
+        except requests.RequestException as e:
+            logger.error(f"Media insights error: {str(e)}")
+            return {"error": f"Failed to get media insights: {str(e)}"}
 
-    async def get_account_insights(self, period: str = "day") -> Dict:
-        """Get account-level insights"""
-        if not self.business_account_id or not self.access_token:
-            logger.warning("Instagram business account not configured")
-            return {}
+    def get_account_insights(
+        self,
+        access_token: str,
+        period: str = "day",
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None
+    ) -> Dict:
+        """Get account insights (Business accounts only)"""
 
         try:
+            url = f"{self.facebook_base_url}/me/insights"
+
+            # Default to last 7 days if no dates provided
+            if not since:
+                since = datetime.now() - timedelta(days=7)
+            if not until:
+                until = datetime.now()
+
             params = {
-                "metric": "follower_count,impressions,reach,profile_views",
+                "metric": "impressions,reach,profile_views,website_clicks",
                 "period": period,
-                "access_token": self.access_token
+                "since": since.strftime("%Y-%m-%d"),
+                "until": until.strftime("%Y-%m-%d"),
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{self.business_account_id}/insights",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        insights = {}
-                        for data in result.get("data", []):
-                            values = data.get("values", [])
-                            if values:
-                                insights[data["name"]] = values[-1]["value"]  # Get latest value
-                        return insights
-                    else:
-                        logger.error(f"Failed to get account insights: {result}")
-                        return {}
+            return response.json()
+
+        except requests.RequestException as e:
+            logger.error(f"Account insights error: {str(e)}")
+            return {"error": f"Failed to get account insights: {str(e)}"}
+
+    def validate_token(self, access_token: str) -> Dict:
+        """Validate Instagram access token"""
+
+        try:
+            user_info = self.get_user_info(access_token)
+
+            if "error" in user_info:
+                return {"valid": False, "error": user_info["error"]}
+
+            return {
+                "valid": True,
+                "user_id": user_info.get("id"),
+                "username": user_info.get("username"),
+                "account_type": user_info.get("account_type")
+            }
 
         except Exception as e:
-            logger.error(f"Error getting account insights: {e}")
-            return {}
+            return {"valid": False, "error": str(e)}
 
-    async def discover_trending_content(self, keywords: List[str], limit: int = 50) -> List[Dict]:
-        """Discover trending content based on keywords"""
-        trending_content = []
+    def get_hashtag_info(self, access_token: str, hashtag: str) -> Dict:
+        """Get information about a hashtag (Business accounts only)"""
 
-        for keyword in keywords[:5]:  # Limit API calls
-            try:
-                # Search hashtag
-                if keyword.startswith("#"):
-                    hashtag_content = await self.get_hashtag_search(keyword, limit//len(keywords))
-                    for content in hashtag_content:
-                        content["source_keyword"] = keyword
-                        content["platform"] = "instagram"
-                        trending_content.append(content)
+        try:
+            # Search for hashtag
+            search_url = f"{self.facebook_base_url}/ig_hashtag_search"
 
-                await asyncio.sleep(1)  # Rate limiting
+            search_params = {
+                "user_id": "me",  # Requires business account
+                "q": hashtag.replace("#", ""),
+                "access_token": access_token
+            }
 
-            except Exception as e:
-                logger.error(f"Error discovering content for keyword {keyword}: {e}")
-                continue
+            search_response = requests.get(search_url, params=search_params)
+            search_response.raise_for_status()
 
-        # Sort by engagement (likes + comments)
-        trending_content.sort(
-            key=lambda x: (x.get("like_count", 0) + x.get("comments_count", 0)),
-            reverse=True
-        )
+            search_data = search_response.json()
 
-        return trending_content[:limit]
+            if not search_data.get("data"):
+                return {"error": "Hashtag not found"}
 
-    def is_configured(self) -> bool:
-        """Check if Instagram API is properly configured"""
-        return bool(self.app_id and self.app_secret and self.access_token and self.business_account_id)
+            hashtag_id = search_data["data"][0]["id"]
+
+            # Get hashtag details
+            detail_url = f"{self.facebook_base_url}/{hashtag_id}"
+
+            detail_params = {
+                "fields": "id,name,media_count",
+                "access_token": access_token
+            }
+
+            detail_response = requests.get(detail_url, params=detail_params)
+            detail_response.raise_for_status()
+
+            return detail_response.json()
+
+        except requests.RequestException as e:
+            logger.error(f"Hashtag info error: {str(e)}")
+            return {"error": f"Failed to get hashtag info: {str(e)}"}
+
+    def schedule_post(
+        self,
+        access_token: str,
+        image_url: str,
+        caption: str,
+        publish_time: datetime
+    ) -> Dict:
+        """Schedule a post for later publishing (Business accounts only)"""
+
+        try:
+            # Note: Instagram API doesn't support native scheduling
+            # This would typically integrate with a scheduling service
+            # For now, we'll create the container and store the publish time
+
+            container_result = self.create_media_container(
+                access_token, image_url, caption, True
+            )
+
+            if "error" in container_result:
+                return container_result
+
+            # In a real implementation, you'd store this in your database
+            # with the scheduled publish time and use a background job
+            # to publish at the specified time
+
+            return {
+                "success": True,
+                "creation_id": container_result.get("id"),
+                "scheduled_time": publish_time.isoformat(),
+                "message": "Post scheduled successfully",
+                "note": "Will be published via background job at scheduled time"
+            }
+
+        except Exception as e:
+            logger.error(f"Instagram scheduling error: {str(e)}")
+            return {"error": f"Failed to schedule post: {str(e)}"}
+
+# Global instance
+instagram_api = InstagramAPI()

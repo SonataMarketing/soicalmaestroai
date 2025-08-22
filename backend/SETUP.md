@@ -1,353 +1,323 @@
-# SocialMaestro - Setup Guide
+# SocialMaestro Backend Setup Guide
 
-This guide will walk you through setting up the SocialMaestro backend from scratch.
+This guide will help you set up the SocialMaestro backend for development and production.
 
-## 📋 Prerequisites
+## Prerequisites
 
-### Required Software
-- **Python 3.9+** - [Download here](https://python.org/downloads/)
-- **PostgreSQL 13+** - [Download here](https://postgresql.org/download/)
-- **Redis 6+** (optional) - [Download here](https://redis.io/download)
-- **Git** - [Download here](https://git-scm.com/downloads)
+- Python 3.8 or higher
+- PostgreSQL 12 or higher
+- Redis (for caching and task queues)
+- Git
 
-### Required API Keys
-You'll need API keys for various services. See the [API Setup Guide](#api-setup-guide) below.
+## Quick Setup
 
-## 🚀 Quick Start
-
-### 1. Clone and Install Dependencies
+### 1. Automated Setup
+Run the setup script to automatically install dependencies:
 
 ```bash
-# Navigate to the backend directory
-cd ai-social-manager/backend
+cd backend
+python setup.py
+```
 
-# Install Python dependencies
+### 2. Manual Setup
+
+#### Install Dependencies
+```bash
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+# On Windows:
+venv\Scripts\activate
+# On macOS/Linux:
+source venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Database Setup
-
+#### Environment Configuration
 ```bash
-# Create PostgreSQL database
-createdb ai_social_manager
-
-# Or using psql
-psql -c "CREATE DATABASE ai_social_manager;"
-```
-
-### 3. Environment Configuration
-
-```bash
-# Copy the example environment file
+# Copy example environment file
 cp .env.example .env
 
-# Edit the .env file with your settings
-nano .env  # or use your preferred editor
+# Edit the .env file with your configuration
+nano .env  # or your preferred editor
 ```
 
-**Minimum required settings for initial setup:**
+## Database Setup
+
+### PostgreSQL Installation
+
+#### Ubuntu/Debian
+```bash
+sudo apt update
+sudo apt install postgresql postgresql-contrib
+```
+
+#### macOS (using Homebrew)
+```bash
+brew install postgresql
+brew services start postgresql
+```
+
+#### Windows
+Download and install from: https://www.postgresql.org/download/windows/
+
+### Database Configuration
+```bash
+# Connect to PostgreSQL
+sudo -u postgres psql
+
+# Create database and user
+CREATE DATABASE socialmaestro_db;
+CREATE USER socialmaestro_user WITH PASSWORD 'your_password';
+GRANT ALL PRIVILEGES ON DATABASE socialmaestro_db TO socialmaestro_user;
+
+# Exit PostgreSQL
+\q
+```
+
+### Initialize Database
+```bash
+# Run database initialization script
+python scripts/init_db.py
+```
+
+## Redis Setup (Optional but Recommended)
+
+### Installation
+
+#### Ubuntu/Debian
+```bash
+sudo apt install redis-server
+sudo systemctl start redis-server
+```
+
+#### macOS (using Homebrew)
+```bash
+brew install redis
+brew services start redis
+```
+
+#### Windows
+Download from: https://redis.io/download
+
+## Environment Variables
+
+Update your `.env` file with the following required variables:
+
+### Database Configuration
 ```env
-SECRET_KEY=your-super-secret-key-change-this
-DATABASE_URL=postgresql://username:password@localhost:5432/ai_social_manager
-GEMINI_API_KEY=your-gemini-api-key-here
+DATABASE_URL=postgresql://socialmaestro_user:your_password@localhost:5432/socialmaestro_db
+DATABASE_HOST=localhost
+DATABASE_PORT=5432
+DATABASE_NAME=socialmaestro_db
+DATABASE_USER=socialmaestro_user
+DATABASE_PASSWORD=your_password
 ```
 
-### 4. Create First Admin User
+### Security
+```env
+SECRET_KEY=your-super-secret-jwt-key-change-this-in-production
+```
 
-You have **three options** to create the first admin user:
+### API Keys (Optional for basic functionality)
+```env
+# OpenAI (for AI content generation)
+OPENAI_API_KEY=your-openai-api-key
 
-#### Option A: CLI Script (Recommended)
+# Social Media APIs
+INSTAGRAM_APP_ID=your-instagram-app-id
+INSTAGRAM_APP_SECRET=your-instagram-app-secret
+FACEBOOK_APP_ID=your-facebook-app-id
+FACEBOOK_APP_SECRET=your-facebook-app-secret
+TWITTER_API_KEY=your-twitter-api-key
+TWITTER_API_SECRET=your-twitter-api-secret
+LINKEDIN_CLIENT_ID=your-linkedin-client-id
+LINKEDIN_CLIENT_SECRET=your-linkedin-client-secret
+```
+
+## Running the Application
+
+### Development Mode
+```bash
+# Activate virtual environment
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Start the development server
+python main.py
+```
+
+The API will be available at:
+- Main API: http://localhost:8000
+- API Documentation: http://localhost:8000/docs
+- Health Check: http://localhost:8000/health
+
+### Production Mode
+```bash
+# Set environment to production
+export DEBUG=False
+
+# Run with Gunicorn (recommended for production)
+pip install gunicorn
+gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+```
+
+## Testing the Setup
+
+### Health Checks
+```bash
+# Test API health
+curl http://localhost:8000/health
+
+# Test database connection
+curl http://localhost:8000/health/database
+
+# Test detailed health
+curl http://localhost:8000/health/detailed
+```
+
+### Authentication Test
 ```bash
 # Check if bootstrap is needed
-python scripts/create_admin.py status
-
-# Create admin user interactively
-python scripts/create_admin.py create
-```
-
-#### Option B: API Bootstrap Endpoint
-```bash
-# Start the server first
-uvicorn main:app --reload --port 8000
-
-# Check bootstrap status
 curl http://localhost:8000/api/auth/bootstrap/status
 
-# Create admin user via API
-curl -X POST "http://localhost:8000/api/auth/bootstrap" \
+# Create admin user (if bootstrap is needed)
+curl -X POST http://localhost:8000/api/auth/bootstrap \
   -H "Content-Type: application/json" \
   -d '{
-    "email": "admin@example.com",
+    "email": "admin@socialmaestro.com",
     "full_name": "Admin User",
-    "password": "SecurePass123!",
-    "confirm_password": "SecurePass123!"
+    "password": "SecurePassword123!",
+    "confirm_password": "SecurePassword123!"
   }'
-```
 
-#### Option C: Direct Database Insert
-```sql
--- Only use this as a last resort
-INSERT INTO users (email, full_name, hashed_password, role, is_active, created_at)
-VALUES (
-  'admin@example.com',
-  'Admin User',
-  '$2b$12$encrypted_password_hash_here',
-  'admin',
-  true,
-  NOW()
-);
-```
-
-### 5. Start the Application
-
-```bash
-# Development mode with auto-reload
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-# Production mode
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-### 6. Verify Installation
-
-1. **API Documentation**: Visit [http://localhost:8000/docs](http://localhost:8000/docs)
-2. **Health Check**: Visit [http://localhost:8000/health](http://localhost:8000/health)
-3. **Login Test**: Use the login endpoint with your admin credentials
-
-## 🔐 API Setup Guide
-
-### Google Gemini AI (Required)
-```bash
-# Get your API key
-# 1. Go to https://makersuite.google.com/app/apikey
-# 2. Create a new API key
-# 3. Add to .env file:
-GEMINI_API_KEY=your-gemini-api-key-here
-```
-
-### Instagram (Meta Business)
-```bash
-# 1. Create Meta Developer account: https://developers.facebook.com/
-# 2. Create new app, add Instagram Basic Display
-# 3. Get your credentials:
-INSTAGRAM_APP_ID=your-app-id
-INSTAGRAM_APP_SECRET=your-app-secret
-INSTAGRAM_ACCESS_TOKEN=your-access-token
-INSTAGRAM_BUSINESS_ACCOUNT_ID=your-business-account-id
-```
-
-### Reddit API
-```bash
-# 1. Go to https://www.reddit.com/prefs/apps
-# 2. Create new application (script type)
-# 3. Add credentials:
-REDDIT_CLIENT_ID=your-client-id
-REDDIT_CLIENT_SECRET=your-client-secret
-```
-
-### Twitter API
-```bash
-# 1. Apply for Twitter Developer account: https://developer.twitter.com/
-# 2. Create new app with read/write permissions
-# 3. Add credentials:
-TWITTER_API_KEY=your-api-key
-TWITTER_API_SECRET=your-api-secret
-TWITTER_ACCESS_TOKEN=your-access-token
-TWITTER_ACCESS_TOKEN_SECRET=your-access-token-secret
-TWITTER_BEARER_TOKEN=your-bearer-token
-```
-
-### LinkedIn API
-```bash
-# 1. Create LinkedIn Developer account: https://developer.linkedin.com/
-# 2. Create new app, request necessary permissions
-# 3. Add credentials:
-LINKEDIN_CLIENT_ID=your-client-id
-LINKEDIN_CLIENT_SECRET=your-client-secret
-LINKEDIN_ACCESS_TOKEN=your-access-token
-```
-
-### Facebook API
-```bash
-# Use same Meta Developer account as Instagram
-# Add Facebook Login and Pages API to your app
-FACEBOOK_APP_ID=your-app-id
-FACEBOOK_APP_SECRET=your-app-secret
-FACEBOOK_ACCESS_TOKEN=your-access-token
-FACEBOOK_PAGE_ID=your-page-id
-```
-
-## 📝 Using the API
-
-### Authentication Flow
-
-1. **Login** to get JWT tokens:
-```bash
-curl -X POST "http://localhost:8000/api/auth/login" \
+# Login
+curl -X POST http://localhost:8000/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{
-    "email": "admin@example.com",
-    "password": "SecurePass123!"
+    "email": "admin@socialmaestro.com",
+    "password": "SecurePassword123!"
   }'
 ```
 
-2. **Use the access token** in subsequent requests:
-```bash
-curl -X GET "http://localhost:8000/api/auth/me" \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
-```
-
-### Creating Additional Users
-
-```bash
-# Only admins can create users
-curl -X POST "http://localhost:8000/api/auth/register" \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "manager@example.com",
-    "full_name": "Marketing Manager",
-    "password": "SecurePass123!",
-    "role": "manager"
-  }'
-```
-
-### Content Operations
-
-```bash
-# Generate AI content
-curl -X POST "http://localhost:8000/api/content/generate" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "brand_id": 1,
-    "content_type": "photo",
-    "platform": "instagram"
-  }'
-
-# List content
-curl -X GET "http://localhost:8000/api/content" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-
-# Approve content
-curl -X POST "http://localhost:8000/api/content/1/approve" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "decision": "approve",
-    "feedback": "Looks great!"
-  }'
-```
-
-## 🐞 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
 #### Database Connection Error
+- Ensure PostgreSQL is running
+- Check database credentials in .env file
+- Verify database and user exist
+
+#### Import Errors
+- Ensure virtual environment is activated
+- Run `pip install -r requirements.txt` again
+
+#### Permission Errors
+- Check file permissions
+- Ensure virtual environment has proper permissions
+
+#### Port Already in Use
+- Change the port in main.py or kill the process using port 8000
+- Check with: `lsof -i :8000` (macOS/Linux) or `netstat -ano | findstr :8000` (Windows)
+
+### Logs
+Check the application logs for detailed error information:
+- Development: Console output
+- Production: `app.log` file
+
+## Development Workflow
+
+### Making Changes
+1. Activate virtual environment
+2. Make your changes
+3. Test locally
+4. Run tests (when available)
+5. Commit changes
+
+### Database Migrations
 ```bash
-# Check if PostgreSQL is running
-sudo systemctl status postgresql
+# When you modify models, recreate tables (development only)
+python scripts/init_db.py
 
-# Check connection
-psql -h localhost -U your_username -d ai_social_manager
+# For production, use proper migrations (TODO: Add Alembic)
 ```
 
-#### Bootstrap Not Working
-```bash
-# Check if users already exist
-python scripts/create_admin.py status
+## Production Deployment
 
-# Reset database (⚠️ This will delete all data)
-psql -c "DROP DATABASE ai_social_manager; CREATE DATABASE ai_social_manager;"
-```
+### Environment Setup
+- Set `DEBUG=False`
+- Use strong `SECRET_KEY`
+- Configure proper CORS origins
+- Set up SSL/TLS
+- Use environment-specific database
 
-#### Permission Denied Errors
-```bash
-# Check user roles
-curl -X GET "http://localhost:8000/api/auth/me" \
-  -H "Authorization: Bearer YOUR_TOKEN"
+### Process Management
+Consider using:
+- **Systemd** (Linux)
+- **PM2** (Node.js process manager)
+- **Docker** (containerization)
+- **Gunicorn** with multiple workers
 
-# List available permissions
-curl -X GET "http://localhost:8000/api/auth/permissions" \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
+### Monitoring
+- Set up logging aggregation
+- Monitor database performance
+- Set up health check endpoints
+- Configure alerts
 
-#### API Integration Issues
-```bash
-# Test API configurations
-python -c "
-from integrations.instagram import InstagramAPI
-from integrations.reddit import RedditAPI
-print('Instagram configured:', InstagramAPI().is_configured())
-print('Reddit configured:', RedditAPI().is_configured())
-"
-```
+## API Documentation
 
-### Debug Mode
+Once running, visit:
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
-Enable detailed logging:
-```env
-LOG_LEVEL=DEBUG
-DEBUG=true
-```
+## Support
 
-### Database Reset
+If you encounter issues:
+1. Check this documentation
+2. Review error logs
+3. Check GitHub issues
+4. Contact support
 
-If you need to start fresh:
-```bash
-# ⚠️ WARNING: This deletes all data
-psql -c "DROP DATABASE ai_social_manager;"
-psql -c "CREATE DATABASE ai_social_manager;"
-python scripts/create_admin.py create
-```
+---
 
-## 🚀 Production Deployment
+## API Key Setup Guides
 
-### Environment Variables
-```env
-ENVIRONMENT=production
-DEBUG=false
-SECRET_KEY=your-very-secure-production-key
-DATABASE_URL=postgresql://user:pass@prod-db:5432/ai_social_manager
-```
+### OpenAI API
+1. Visit https://platform.openai.com/
+2. Create an account or sign in
+3. Go to API Keys section
+4. Create a new API key
+5. Add to your .env file
 
-### Docker Deployment
-```bash
-# Build and run with Docker
-docker build -t ai-social-manager .
-docker run -p 8000:8000 ai-social-manager
+### Social Media APIs
 
-# Or use docker-compose
-docker-compose up -d
-```
+#### Instagram Basic Display API
+1. Visit https://developers.facebook.com/
+2. Create a new app
+3. Add Instagram Basic Display product
+4. Configure OAuth redirect URIs
+5. Get App ID and App Secret
 
-### Security Checklist
-- [ ] Change default SECRET_KEY
-- [ ] Use strong passwords for admin users
-- [ ] Enable HTTPS in production
-- [ ] Configure proper CORS origins
-- [ ] Set up database backups
-- [ ] Enable API rate limiting
-- [ ] Review and rotate API keys regularly
+#### Facebook Graph API
+1. Use the same app from Instagram setup
+2. Add Facebook Login product
+3. Configure permissions
+4. Get App ID and App Secret
 
-## 📚 Next Steps
+#### Twitter API v2
+1. Visit https://developer.twitter.com/
+2. Apply for developer account
+3. Create a new app
+4. Generate API keys and tokens
+5. Add to your .env file
 
-1. **Configure Social Media APIs** - Add your platform API keys
-2. **Create Brands** - Set up brand profiles and style guides
-3. **Enable Automation** - Turn on automated content generation
-4. **Set Up Notifications** - Configure Slack/email notifications
-5. **Monitor Performance** - Check analytics and adjust settings
+#### LinkedIn API
+1. Visit https://www.linkedin.com/developers/
+2. Create a new app
+3. Configure OAuth 2.0 settings
+4. Get Client ID and Client Secret
 
-## 🆘 Support
-
-- **Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Logs**: Check application logs for detailed error information
-- **GitHub Issues**: Report bugs and feature requests
-- **Email**: support@aisocialmanager.com
-
-## 📖 Additional Resources
-
-- [API Documentation](http://localhost:8000/docs)
-- [Database Schema](./database/models.py)
-- [Configuration Guide](./.env.example)
-- [Deployment Guide](./README.md#deployment)
+Remember to keep all API keys secure and never commit them to version control!

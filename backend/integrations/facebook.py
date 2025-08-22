@@ -1,76 +1,115 @@
 """
 Facebook API Integration
-Real API integration using Facebook Graph API for posting and analytics
+Facebook Graph API integration for page posting, analytics, and content management
 """
 
+import requests
 import logging
-import asyncio
-from datetime import datetime
-from typing import Dict, List, Optional
-import aiohttp
-import json
-from urllib.parse import urlencode
-
-from config.settings import get_settings
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 class FacebookAPI:
-    """Facebook Graph API client"""
+    """Facebook Graph API integration for social media management"""
 
     def __init__(self):
         self.app_id = settings.facebook_app_id
         self.app_secret = settings.facebook_app_secret
-        self.access_token = settings.facebook_access_token
-        self.page_id = settings.facebook_page_id
+        self.redirect_uri = settings.facebook_redirect_uri
         self.base_url = "https://graph.facebook.com/v18.0"
 
-    async def get_auth_url(self, redirect_uri: str, state: str = None) -> str:
-        """Generate Facebook authorization URL"""
-        params = {
-            "client_id": self.app_id,
-            "redirect_uri": redirect_uri,
-            "scope": "pages_manage_posts,pages_read_engagement,pages_show_list,public_profile",
-            "response_type": "code",
-            "state": state or "facebook_auth"
+    def is_configured(self) -> bool:
+        """Check if Facebook API is properly configured"""
+        return bool(self.app_id and self.app_secret)
+
+    def get_authorization_url(self, state: str = None) -> Dict:
+        """Get Facebook OAuth authorization URL"""
+
+        if not self.is_configured():
+            return {"error": "Facebook API not configured"}
+
+        # Facebook OAuth scopes for page management
+        scopes = [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+            "pages_manage_engagement",
+            "public_profile"
+        ]
+
+        auth_url = (
+            f"https://www.facebook.com/v18.0/dialog/oauth"
+            f"?client_id={self.app_id}"
+            f"&redirect_uri={self.redirect_uri}"
+            f"&scope={','.join(scopes)}"
+            f"&response_type=code"
+        )
+
+        if state:
+            auth_url += f"&state={state}"
+
+        return {
+            "authorization_url": auth_url,
+            "redirect_uri": self.redirect_uri,
+            "scopes": scopes
         }
 
-        auth_url = f"https://www.facebook.com/v18.0/dialog/oauth?{urlencode(params)}"
-        return auth_url
-
-    async def exchange_code_for_token(self, code: str, redirect_uri: str) -> Dict:
+    def exchange_code_for_token(self, authorization_code: str) -> Dict:
         """Exchange authorization code for access token"""
+
+        if not self.is_configured():
+            return {"error": "Facebook API not configured"}
+
         try:
+            # Step 1: Get short-lived user access token
+            token_url = f"{self.base_url}/oauth/access_token"
+
             params = {
                 "client_id": self.app_id,
                 "client_secret": self.app_secret,
-                "redirect_uri": redirect_uri,
-                "code": code
+                "redirect_uri": self.redirect_uri,
+                "code": authorization_code
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/oauth/access_token",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(token_url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        # Get long-lived token
-                        long_lived_token = await self.get_long_lived_token(result["access_token"])
-                        return long_lived_token
-                    else:
-                        logger.error(f"Failed to exchange code for token: {result}")
-                        return {"error": result}
+            token_data = response.json()
+            short_token = token_data.get("access_token")
 
-        except Exception as e:
-            logger.error(f"Error exchanging code for token: {e}")
-            return {"error": str(e)}
+            if not short_token:
+                return {"error": "Failed to get access token"}
 
-    async def get_long_lived_token(self, short_token: str) -> Dict:
+            # Step 2: Exchange for long-lived token
+            long_lived_token = self._get_long_lived_token(short_token)
+
+            if "error" in long_lived_token:
+                return long_lived_token
+
+            # Step 3: Get user info and pages
+            user_info = self.get_user_info(long_lived_token["access_token"])
+            pages = self.get_user_pages(long_lived_token["access_token"])
+
+            return {
+                "access_token": long_lived_token["access_token"],
+                "expires_in": long_lived_token.get("expires_in"),
+                "user_info": user_info,
+                "pages": pages,
+                "token_type": "long_lived"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Facebook token exchange error: {str(e)}")
+            return {"error": f"Token exchange failed: {str(e)}"}
+
+    def _get_long_lived_token(self, short_token: str) -> Dict:
         """Convert short-lived token to long-lived token"""
+
         try:
+            url = f"{self.base_url}/oauth/access_token"
+
             params = {
                 "grant_type": "fb_exchange_token",
                 "client_id": self.app_id,
@@ -78,474 +117,548 @@ class FacebookAPI:
                 "fb_exchange_token": short_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/oauth/access_token",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return {
-                            "access_token": result["access_token"],
-                            "token_type": result.get("token_type", "bearer"),
-                            "expires_in": result.get("expires_in", 5183944)  # ~60 days
-                        }
-                    else:
-                        logger.error(f"Failed to get long-lived token: {result}")
-                        return {"error": result}
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting long-lived token: {e}")
-            return {"error": str(e)}
+        except requests.RequestException as e:
+            logger.error(f"Long-lived token error: {str(e)}")
+            return {"error": f"Long-lived token generation failed: {str(e)}"}
 
-    async def get_user_pages(self, access_token: str = None) -> List[Dict]:
-        """Get Facebook pages managed by the user"""
-        token = access_token or self.access_token
+    def get_user_info(self, access_token: str) -> Dict:
+        """Get Facebook user information"""
 
         try:
+            url = f"{self.base_url}/me"
+
             params = {
-                "access_token": token,
-                "fields": "id,name,category,access_token,fan_count,picture"
+                "fields": "id,name,email",
+                "access_token": access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/me/accounts",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        return result.get("data", [])
-                    else:
-                        logger.error(f"Failed to get user pages: {result}")
-                        return []
+            return response.json()
 
-        except Exception as e:
-            logger.error(f"Error getting user pages: {e}")
+        except requests.RequestException as e:
+            logger.error(f"User info error: {str(e)}")
+            return {"error": f"Failed to get user info: {str(e)}"}
+
+    def get_user_pages(self, access_token: str) -> List[Dict]:
+        """Get user's Facebook pages with management permissions"""
+
+        try:
+            url = f"{self.base_url}/me/accounts"
+
+            params = {
+                "fields": "id,name,access_token,category,fan_count,picture,is_published",
+                "access_token": access_token
+            }
+
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            return data.get("data", [])
+
+        except requests.RequestException as e:
+            logger.error(f"Get pages error: {str(e)}")
             return []
 
-    async def post_text(self, message: str, page_access_token: str = None) -> Dict:
-        """Post text-only message to Facebook page"""
-        try:
-            if not self.page_id:
-                return {"error": "Facebook page not configured", "success": False}
+    def post_to_page(
+        self,
+        page_id: str,
+        page_access_token: str,
+        message: str,
+        link: str = None,
+        image_url: str = None
+    ) -> Dict:
+        """Post message to Facebook page"""
 
-            token = page_access_token or self.access_token
+        try:
+            url = f"{self.base_url}/{page_id}/feed"
 
             data = {
                 "message": message,
-                "access_token": token
+                "access_token": page_access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/{self.page_id}/feed",
-                    data=data
-                ) as response:
-                    result = await response.json()
+            # Add link if provided
+            if link:
+                data["link"] = link
 
-                    if response.status == 200:
-                        post_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": post_id,
-                            "post_url": f"https://www.facebook.com/{post_id}" if post_id else None
-                        }
-                    else:
-                        logger.error(f"Failed to post to Facebook: {result}")
-                        return {"error": result, "success": False}
+            # Add image if provided
+            if image_url:
+                # For images, we use the photos endpoint
+                return self.post_photo_to_page(page_id, page_access_token, image_url, message)
 
-        except Exception as e:
-            logger.error(f"Error posting to Facebook: {e}")
-            return {"error": str(e), "success": False}
+            response = requests.post(url, data=data)
+            response.raise_for_status()
 
-    async def post_with_media(self, message: str, media_url: str, page_access_token: str = None) -> Dict:
-        """Post message with media to Facebook page"""
-        try:
-            if not self.page_id:
-                return {"error": "Facebook page not configured", "success": False}
+            result = response.json()
 
-            token = page_access_token or self.access_token
+            return {
+                "success": True,
+                "post_id": result.get("id"),
+                "message": "Post published successfully to Facebook"
+            }
 
-            # Determine if it's a photo or video based on URL
-            is_video = any(ext in media_url.lower() for ext in ['.mp4', '.mov', '.avi', '.mkv'])
+        except requests.RequestException as e:
+            logger.error(f"Facebook post error: {str(e)}")
+            return {"error": f"Failed to post to Facebook: {str(e)}"}
 
-            if is_video:
-                return await self._post_video(message, media_url, token)
-            else:
-                return await self._post_photo(message, media_url, token)
-
-        except Exception as e:
-            logger.error(f"Error posting with media to Facebook: {e}")
-            return {"error": str(e), "success": False}
-
-    async def _post_photo(self, message: str, photo_url: str, token: str) -> Dict:
+    def post_photo_to_page(
+        self,
+        page_id: str,
+        page_access_token: str,
+        image_url: str,
+        caption: str = ""
+    ) -> Dict:
         """Post photo to Facebook page"""
+
         try:
+            url = f"{self.base_url}/{page_id}/photos"
+
             data = {
-                "message": message,
-                "url": photo_url,
-                "access_token": token
+                "url": image_url,
+                "caption": caption,
+                "access_token": page_access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/{self.page_id}/photos",
-                    data=data
-                ) as response:
-                    result = await response.json()
+            response = requests.post(url, data=data)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        post_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": post_id,
-                            "post_url": f"https://www.facebook.com/{post_id}" if post_id else None
-                        }
-                    else:
-                        logger.error(f"Failed to post photo to Facebook: {result}")
-                        return {"error": result, "success": False}
+            result = response.json()
 
-        except Exception as e:
-            logger.error(f"Error posting photo to Facebook: {e}")
-            return {"error": str(e), "success": False}
-
-    async def _post_video(self, message: str, video_url: str, token: str) -> Dict:
-        """Post video to Facebook page"""
-        try:
-            data = {
-                "description": message,
-                "file_url": video_url,
-                "access_token": token
+            return {
+                "success": True,
+                "post_id": result.get("id"),
+                "photo_id": result.get("post_id"),
+                "message": "Photo posted successfully to Facebook"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/{self.page_id}/videos",
-                    data=data
-                ) as response:
-                    result = await response.json()
+        except requests.RequestException as e:
+            logger.error(f"Facebook photo post error: {str(e)}")
+            return {"error": f"Failed to post photo to Facebook: {str(e)}"}
 
-                    if response.status == 200:
-                        video_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": video_id,
-                            "post_url": f"https://www.facebook.com/{video_id}" if video_id else None
-                        }
-                    else:
-                        logger.error(f"Failed to post video to Facebook: {result}")
-                        return {"error": result, "success": False}
+    def upload_video_to_page(
+        self,
+        page_id: str,
+        page_access_token: str,
+        video_url: str,
+        title: str = "",
+        description: str = ""
+    ) -> Dict:
+        """Upload video to Facebook page"""
 
-        except Exception as e:
-            logger.error(f"Error posting video to Facebook: {e}")
-            return {"error": str(e), "success": False}
+        try:
+            # Download video first
+            video_response = requests.get(video_url)
+            video_response.raise_for_status()
 
-    async def get_page_posts(self, limit: int = 25, page_access_token: str = None) -> List[Dict]:
+            url = f"{self.base_url}/{page_id}/videos"
+
+            files = {
+                "source": ("video.mp4", video_response.content, "video/mp4")
+            }
+
+            data = {
+                "title": title,
+                "description": description,
+                "access_token": page_access_token
+            }
+
+            response = requests.post(url, files=files, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+
+            return {
+                "success": True,
+                "video_id": result.get("id"),
+                "message": "Video uploaded successfully to Facebook"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Facebook video upload error: {str(e)}")
+            return {"error": f"Failed to upload video to Facebook: {str(e)}"}
+
+    def get_page_posts(
+        self,
+        page_id: str,
+        page_access_token: str,
+        limit: int = 25
+    ) -> Dict:
         """Get posts from Facebook page"""
-        try:
-            if not self.page_id:
-                return []
 
-            token = page_access_token or self.access_token
+        try:
+            url = f"{self.base_url}/{page_id}/posts"
 
             params = {
-                "fields": "id,message,created_time,permalink_url,attachments,insights.metric(post_impressions,post_engaged_users)",
+                "fields": "id,message,story,created_time,type,status_type,permalink_url,insights.metric(post_impressions,post_engaged_users,post_clicks)",
                 "limit": limit,
-                "access_token": token
+                "access_token": page_access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{self.page_id}/posts",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        posts = []
-                        for post in result.get("data", []):
-                            post_data = {
-                                "id": post.get("id"),
-                                "message": post.get("message", ""),
-                                "created_time": post.get("created_time"),
-                                "permalink_url": post.get("permalink_url"),
-                                "has_attachments": bool(post.get("attachments")),
-                                "insights": post.get("insights", {}).get("data", [])
-                            }
-                            posts.append(post_data)
+            data = response.json()
+            posts = []
 
-                        return posts
-                    else:
-                        logger.error(f"Failed to get page posts: {result}")
-                        return []
+            for post in data.get("data", []):
+                post_data = {
+                    "id": post.get("id"),
+                    "message": post.get("message", ""),
+                    "story": post.get("story", ""),
+                    "created_time": post.get("created_time"),
+                    "type": post.get("type"),
+                    "status_type": post.get("status_type"),
+                    "permalink_url": post.get("permalink_url"),
+                    "insights": {}
+                }
 
-        except Exception as e:
-            logger.error(f"Error getting page posts: {e}")
-            return []
+                # Extract insights if available
+                if "insights" in post and "data" in post["insights"]:
+                    for insight in post["insights"]["data"]:
+                        metric_name = insight.get("name")
+                        metric_values = insight.get("values", [])
+                        if metric_values:
+                            post_data["insights"][metric_name] = metric_values[0].get("value", 0)
 
-    async def get_post_insights(self, post_id: str, page_access_token: str = None) -> Dict:
-        """Get insights for a specific post"""
+                posts.append(post_data)
+
+            return {"success": True, "posts": posts}
+
+        except requests.RequestException as e:
+            logger.error(f"Get page posts error: {str(e)}")
+            return {"error": f"Failed to get page posts: {str(e)}"}
+
+    def get_post_insights(
+        self,
+        post_id: str,
+        page_access_token: str
+    ) -> Dict:
+        """Get insights for a specific Facebook post"""
+
         try:
-            token = page_access_token or self.access_token
-
-            metrics = [
-                "post_impressions",
-                "post_engaged_users",
-                "post_reactions_like_total",
-                "post_reactions_love_total",
-                "post_reactions_wow_total",
-                "post_reactions_haha_total",
-                "post_reactions_sorry_total",
-                "post_reactions_anger_total",
-                "post_clicks",
-                "post_comments",
-                "post_shares"
-            ]
+            url = f"{self.base_url}/{post_id}/insights"
 
             params = {
-                "metric": ",".join(metrics),
-                "access_token": token
+                "metric": "post_impressions,post_engaged_users,post_clicks,post_reactions_by_type_total",
+                "access_token": page_access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{post_id}/insights",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        insights = {}
-                        for data in result.get("data", []):
-                            metric_name = data.get("name")
-                            values = data.get("values", [])
-                            if values:
-                                insights[metric_name] = values[0].get("value", 0)
+            data = response.json()
+            insights = {}
 
-                        return insights
-                    else:
-                        logger.error(f"Failed to get post insights: {result}")
-                        return {}
+            for insight in data.get("data", []):
+                metric_name = insight.get("name")
+                metric_values = insight.get("values", [])
+                if metric_values:
+                    insights[metric_name] = metric_values[0].get("value", 0)
 
-        except Exception as e:
-            logger.error(f"Error getting post insights: {e}")
-            return {}
+            return {"success": True, "insights": insights}
 
-    async def get_page_insights(self, page_access_token: str = None) -> Dict:
-        """Get page-level insights"""
+        except requests.RequestException as e:
+            logger.error(f"Post insights error: {str(e)}")
+            return {"error": f"Failed to get post insights: {str(e)}"}
+
+    def get_page_insights(
+        self,
+        page_id: str,
+        page_access_token: str,
+        period: str = "day",
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None
+    ) -> Dict:
+        """Get page insights and analytics"""
+
         try:
-            if not self.page_id:
-                return {}
+            url = f"{self.base_url}/{page_id}/insights"
 
-            token = page_access_token or self.access_token
-
-            metrics = [
-                "page_fans",
-                "page_impressions",
-                "page_post_engagements",
-                "page_posts_impressions",
-                "page_video_views"
-            ]
+            # Default to last 7 days if no dates provided
+            if not since:
+                since = datetime.now() - timedelta(days=7)
+            if not until:
+                until = datetime.now()
 
             params = {
-                "metric": ",".join(metrics),
-                "period": "day",
-                "access_token": token
+                "metric": "page_impressions,page_engaged_users,page_fan_adds,page_fan_removes,page_views_total",
+                "period": period,
+                "since": since.strftime("%Y-%m-%d"),
+                "until": until.strftime("%Y-%m-%d"),
+                "access_token": page_access_token
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{self.page_id}/insights",
-                    params=params
-                ) as response:
-                    result = await response.json()
+            response = requests.get(url, params=params)
+            response.raise_for_status()
 
-                    if response.status == 200:
-                        insights = {}
-                        for data in result.get("data", []):
-                            metric_name = data.get("name")
-                            values = data.get("values", [])
-                            if values:
-                                insights[metric_name] = values[-1].get("value", 0)  # Get latest value
+            data = response.json()
+            insights = {}
 
-                        return insights
-                    else:
-                        logger.error(f"Failed to get page insights: {result}")
-                        return {}
+            for insight in data.get("data", []):
+                metric_name = insight.get("name")
+                metric_values = insight.get("values", [])
+                if metric_values:
+                    # Get the latest value
+                    insights[metric_name] = metric_values[-1].get("value", 0)
 
-        except Exception as e:
-            logger.error(f"Error getting page insights: {e}")
-            return {}
+            return {"success": True, "insights": insights, "period": period}
 
-    async def delete_post(self, post_id: str, page_access_token: str = None) -> Dict:
-        """Delete a post from Facebook page"""
-        try:
-            token = page_access_token or self.access_token
+        except requests.RequestException as e:
+            logger.error(f"Page insights error: {str(e)}")
+            return {"error": f"Failed to get page insights: {str(e)}"}
 
-            params = {
-                "access_token": token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.delete(
-                    f"{self.base_url}/{post_id}",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200 and result.get("success"):
-                        return {"success": True, "post_id": post_id}
-                    else:
-                        logger.error(f"Failed to delete post: {result}")
-                        return {"error": result, "success": False}
-
-        except Exception as e:
-            logger.error(f"Error deleting post: {e}")
-            return {"error": str(e), "success": False}
-
-    async def get_page_info(self, page_access_token: str = None) -> Dict:
-        """Get Facebook page information"""
-        try:
-            if not self.page_id:
-                return {}
-
-            token = page_access_token or self.access_token
-
-            params = {
-                "fields": "id,name,category,fan_count,talking_about_count,picture,cover,website,about",
-                "access_token": token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/{self.page_id}",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        return result
-                    else:
-                        logger.error(f"Failed to get page info: {result}")
-                        return {}
-
-        except Exception as e:
-            logger.error(f"Error getting page info: {e}")
-            return {}
-
-    async def search_posts(self, query: str, limit: int = 25) -> List[Dict]:
-        """Search for public posts (requires additional permissions)"""
-        try:
-            # Note: This requires special permissions and may not be available
-            # for all apps due to Facebook's platform policy changes
-
-            params = {
-                "q": query,
-                "type": "post",
-                "limit": limit,
-                "access_token": self.access_token
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.base_url}/search",
-                    params=params
-                ) as response:
-                    result = await response.json()
-
-                    if response.status == 200:
-                        return result.get("data", [])
-                    else:
-                        logger.warning(f"Search not available or insufficient permissions: {result}")
-                        return []
-
-        except Exception as e:
-            logger.error(f"Error searching posts: {e}")
-            return []
-
-    async def discover_trending_content(self, keywords: List[str], limit: int = 50) -> List[Dict]:
-        """Discover trending content based on keywords"""
-        # Facebook's API is very restrictive for content discovery
-        # Most search APIs have been deprecated or require special permissions
-
-        trending_content = []
-
-        # Limited options available:
-        # 1. Posts from your own page
-        # 2. Posts from pages you manage
-        # 3. Public posts (very limited access)
+    def schedule_post(
+        self,
+        page_id: str,
+        page_access_token: str,
+        message: str,
+        scheduled_time: datetime,
+        link: str = None,
+        image_url: str = None
+    ) -> Dict:
+        """Schedule a post for later publishing"""
 
         try:
-            # Get posts from your own page that might be relevant
-            page_posts = await self.get_page_posts(limit=20)
+            # Facebook requires Unix timestamp for scheduled publishing
+            scheduled_timestamp = int(scheduled_time.timestamp())
 
-            for post in page_posts:
-                # Simple keyword matching
-                message = post.get("message", "").lower()
-                if any(keyword.lower() in message for keyword in keywords):
-                    post["platform"] = "facebook"
-                    post["source_keyword"] = next(
-                        keyword for keyword in keywords
-                        if keyword.lower() in message
-                    )
-                    trending_content.append(post)
-
-            logger.info(f"Facebook content discovery limited by API restrictions for keywords: {keywords}")
-
-        except Exception as e:
-            logger.error(f"Error discovering Facebook content: {e}")
-
-        return trending_content[:limit]
-
-    async def schedule_post(self, message: str, publish_time: datetime,
-                          media_url: str = None, page_access_token: str = None) -> Dict:
-        """Schedule a post for future publication"""
-        try:
-            if not self.page_id:
-                return {"error": "Facebook page not configured", "success": False}
-
-            token = page_access_token or self.access_token
-
-            # Convert datetime to Unix timestamp
-            scheduled_timestamp = int(publish_time.timestamp())
+            url = f"{self.base_url}/{page_id}/feed"
 
             data = {
                 "message": message,
                 "scheduled_publish_time": scheduled_timestamp,
                 "published": "false",  # This makes it scheduled
-                "access_token": token
+                "access_token": page_access_token
             }
 
-            if media_url:
-                # For media posts, we'd need to upload the media first
-                # This is a simplified version
-                data["url"] = media_url
-                endpoint = f"{self.base_url}/{self.page_id}/photos"
+            # Add link if provided
+            if link:
+                data["link"] = link
+
+            # For images with scheduled posts, we need to upload first
+            if image_url:
+                # Upload image first to get attachment
+                upload_result = self._upload_image_for_scheduling(
+                    page_id, page_access_token, image_url
+                )
+                if "error" not in upload_result:
+                    data["object_attachment"] = upload_result["id"]
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+
+            return {
+                "success": True,
+                "post_id": result.get("id"),
+                "scheduled_time": scheduled_time.isoformat(),
+                "message": "Post scheduled successfully for Facebook"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Facebook scheduling error: {str(e)}")
+            return {"error": f"Failed to schedule Facebook post: {str(e)}"}
+
+    def _upload_image_for_scheduling(
+        self,
+        page_id: str,
+        page_access_token: str,
+        image_url: str
+    ) -> Dict:
+        """Upload image for scheduled posts"""
+
+        try:
+            # Download image
+            image_response = requests.get(image_url)
+            image_response.raise_for_status()
+
+            url = f"{self.base_url}/{page_id}/photos"
+
+            files = {
+                "source": ("image.jpg", image_response.content, "image/jpeg")
+            }
+
+            data = {
+                "published": "false",  # Don't publish, just upload
+                "access_token": page_access_token
+            }
+
+            response = requests.post(url, files=files, data=data)
+            response.raise_for_status()
+
+            return response.json()
+
+        except requests.RequestException as e:
+            logger.error(f"Image upload error: {str(e)}")
+            return {"error": f"Failed to upload image: {str(e)}"}
+
+    def delete_post(self, post_id: str, page_access_token: str) -> Dict:
+        """Delete a Facebook post"""
+
+        try:
+            url = f"{self.base_url}/{post_id}"
+
+            params = {
+                "access_token": page_access_token
+            }
+
+            response = requests.delete(url, params=params)
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "post_id": post_id,
+                    "message": "Post deleted successfully"
+                }
             else:
-                endpoint = f"{self.base_url}/{self.page_id}/feed"
+                return {"error": "Failed to delete post"}
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(endpoint, data=data) as response:
-                    result = await response.json()
+        except requests.RequestException as e:
+            logger.error(f"Facebook delete error: {str(e)}")
+            return {"error": f"Failed to delete post: {str(e)}"}
 
-                    if response.status == 200:
-                        post_id = result.get("id")
-                        return {
-                            "success": True,
-                            "post_id": post_id,
-                            "scheduled_time": publish_time.isoformat()
-                        }
-                    else:
-                        logger.error(f"Failed to schedule Facebook post: {result}")
-                        return {"error": result, "success": False}
+    def get_page_info(self, page_id: str, page_access_token: str) -> Dict:
+        """Get detailed information about a Facebook page"""
+
+        try:
+            url = f"{self.base_url}/{page_id}"
+
+            params = {
+                "fields": "id,name,category,description,fan_count,engagement,picture,cover,website,phone,location",
+                "access_token": page_access_token
+            }
+
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+
+            return {"success": True, "page_info": response.json()}
+
+        except requests.RequestException as e:
+            logger.error(f"Get page info error: {str(e)}")
+            return {"error": f"Failed to get page info: {str(e)}"}
+
+    def validate_token(self, access_token: str) -> Dict:
+        """Validate Facebook access token"""
+
+        try:
+            user_info = self.get_user_info(access_token)
+
+            if "error" in user_info:
+                return {"valid": False, "error": user_info["error"]}
+
+            pages = self.get_user_pages(access_token)
+
+            return {
+                "valid": True,
+                "user_id": user_info.get("id"),
+                "user_name": user_info.get("name"),
+                "pages_count": len(pages)
+            }
 
         except Exception as e:
-            logger.error(f"Error scheduling Facebook post: {e}")
-            return {"error": str(e), "success": False}
+            return {"valid": False, "error": str(e)}
 
-    def is_configured(self) -> bool:
-        """Check if Facebook API is properly configured"""
-        return bool(self.app_id and self.app_secret and self.access_token and self.page_id)
+    def create_lead_ad(
+        self,
+        page_id: str,
+        page_access_token: str,
+        name: str,
+        objective: str = "LEAD_GENERATION"
+    ) -> Dict:
+        """Create a lead generation ad campaign (basic setup)"""
+
+        try:
+            # This is a simplified version - full implementation would require
+            # campaign creation, ad set creation, and ad creative setup
+
+            url = f"{self.base_url}/{page_id}/campaigns"
+
+            data = {
+                "name": name,
+                "objective": objective,
+                "status": "PAUSED",  # Start paused for review
+                "access_token": page_access_token
+            }
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+
+            return {
+                "success": True,
+                "campaign_id": result.get("id"),
+                "message": "Lead ad campaign created successfully"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Lead ad creation error: {str(e)}")
+            return {"error": f"Failed to create lead ad: {str(e)}"}
+
+    def get_comments(self, post_id: str, page_access_token: str) -> Dict:
+        """Get comments for a Facebook post"""
+
+        try:
+            url = f"{self.base_url}/{post_id}/comments"
+
+            params = {
+                "fields": "id,message,created_time,from,like_count,comment_count",
+                "access_token": page_access_token
+            }
+
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+
+            return {"success": True, "comments": data.get("data", [])}
+
+        except requests.RequestException as e:
+            logger.error(f"Get comments error: {str(e)}")
+            return {"error": f"Failed to get comments: {str(e)}"}
+
+    def reply_to_comment(
+        self,
+        comment_id: str,
+        page_access_token: str,
+        message: str
+    ) -> Dict:
+        """Reply to a comment on Facebook"""
+
+        try:
+            url = f"{self.base_url}/{comment_id}/comments"
+
+            data = {
+                "message": message,
+                "access_token": page_access_token
+            }
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+
+            return {
+                "success": True,
+                "reply_id": result.get("id"),
+                "message": "Reply posted successfully"
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Reply to comment error: {str(e)}")
+            return {"error": f"Failed to reply to comment: {str(e)}"}
+
+# Global instance
+facebook_api = FacebookAPI()

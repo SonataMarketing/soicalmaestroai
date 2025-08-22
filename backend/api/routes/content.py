@@ -1,168 +1,349 @@
 """
 Content Management API Routes
-Complete CRUD operations for content, scheduling, and platform integrations
+AI content generation, social media posting, and content management
 """
 
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, desc
 from pydantic import BaseModel, Field
 
 from database.database import get_db
-from database.models import (
-    ContentPost, Brand, User, PostStatus, PostType, Platform,
-    ScrapedContent, ContentReview
-)
-from api.dependencies import (
-    get_current_user, require_permission, RequirePermission,
-    verify_brand_access, validate_content_ownership,
-    get_pagination_params, PaginationParams, get_filter_params,
-    FilterParams, audit_log
-)
-from modules.generator import ContentGenerator
-from modules.scraper import ContentScraper
-from modules.notifier import NotificationManager
-from integrations.webhooks import get_webhook_manager
+from database.models import User, Brand, ContentPost, SocialAccount, PostStatus, PostType, Platform
+from api.dependencies import get_current_user
+from modules.ai_content_generator import ai_generator
+from integrations.instagram import instagram_api
+from integrations.twitter import twitter_api
+from integrations.facebook import facebook_api
+from integrations.linkedin import linkedin_api
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Initialize services
-generator = ContentGenerator()
-scraper = ContentScraper()
-notifier = NotificationManager()
-webhook_manager = get_webhook_manager()
-
-# Pydantic models
-class ContentCreate(BaseModel):
-    title: Optional[str] = None
-    caption: str = Field(..., min_length=1, max_length=5000)
-    content_type: PostType
-    platform: Platform
-    scheduled_time: Optional[datetime] = None
-    image_url: Optional[str] = None
-    video_url: Optional[str] = None
-    media_description: Optional[str] = None
+# Pydantic models for requests/responses
+class ContentGenerationRequest(BaseModel):
     brand_id: int
-
-class ContentUpdate(BaseModel):
-    title: Optional[str] = None
-    caption: Optional[str] = Field(None, min_length=1, max_length=5000)
-    scheduled_time: Optional[datetime] = None
-    image_url: Optional[str] = None
-    video_url: Optional[str] = None
-    media_description: Optional[str] = None
-    status: Optional[PostStatus] = None
+    platform: str = Field(..., regex="^(instagram|twitter|linkedin|facebook)$")
+    content_type: str = Field(..., regex="^(photo|video|text|carousel)$")
+    topic: Optional[str] = None
+    additional_context: Optional[str] = None
 
 class ContentResponse(BaseModel):
     id: int
     title: Optional[str]
     caption: str
-    content_type: PostType
-    platform: Platform
+    content_type: str
+    platform: str
+    status: str
+    brand_alignment_score: float
+    created_at: datetime
     scheduled_time: Optional[datetime]
     published_time: Optional[datetime]
-    status: PostStatus
-    brand_alignment_score: float
-    risk_score: str
-    image_url: Optional[str]
-    video_url: Optional[str]
-    brand_id: int
-    created_by_ai: bool
-    created_at: datetime
-    updated_at: Optional[datetime]
-
-    # Engagement metrics
-    likes_count: int = 0
-    comments_count: int = 0
-    shares_count: int = 0
-    reach: int = 0
-    actual_engagement_rate: float = 0.0
 
     class Config:
         from_attributes = True
 
-class ContentGenerate(BaseModel):
-    brand_id: int
-    content_type: Optional[PostType] = None
-    platform: Optional[Platform] = None
-    inspiration_keywords: Optional[List[str]] = None
-    custom_prompt: Optional[str] = None
-
-class ContentApproval(BaseModel):
-    decision: str = Field(..., regex="^(approve|reject|request_changes)$")
-    feedback: Optional[str] = None
-    suggested_changes: Optional[str] = None
-
-class BulkAction(BaseModel):
-    content_ids: List[int]
-    action: str = Field(..., regex="^(approve|reject|delete|schedule|publish)$")
+class SocialMediaPostRequest(BaseModel):
+    content_id: int
+    social_account_id: int
     scheduled_time: Optional[datetime] = None
 
-class ScrapingRequest(BaseModel):
+class HashtagGenerationRequest(BaseModel):
+    content: str
+    platform: str
     brand_id: int
-    keywords: Optional[List[str]] = None
-    platforms: Optional[List[str]] = ["instagram", "reddit"]
-    limit: Optional[int] = Field(default=50, le=100)
+    target_count: int = Field(default=10, ge=1, le=30)
 
-# Content CRUD Operations
+class ContentIdeasRequest(BaseModel):
+    brand_id: int
+    platform: str
+    count: int = Field(default=5, ge=1, le=10)
 
-@router.get("/content", response_model=List[ContentResponse])
-async def list_content(
-    pagination: PaginationParams = Depends(get_pagination_params),
-    filters: FilterParams = Depends(get_filter_params),
-    brand_id: Optional[int] = Query(None),
-    status: Optional[PostStatus] = Query(None),
-    platform: Optional[Platform] = Query(None),
-    content_type: Optional[PostType] = Query(None),
-    current_user: User = RequirePermission.view_brands,
+class ContentOptimizationRequest(BaseModel):
+    content: str
+    source_platform: str
+    target_platform: str
+    brand_id: int
+
+class BrandVoiceAnalysisRequest(BaseModel):
+    brand_id: int
+    sample_content: List[str] = Field(..., max_items=10)
+
+# Content Generation Endpoints
+@router.post("/generate", response_model=Dict)
+async def generate_content(
+    request: ContentGenerationRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List content with filtering and pagination"""
+    """Generate AI-powered content for social media"""
 
-    query = db.query(ContentPost)
+    # Get brand information
+    brand = db.query(Brand).filter(
+        Brand.id == request.brand_id,
+        Brand.owner_id == current_user.id
+    ).first()
 
-    # Apply brand access filter
-    from api.dependencies import get_brand_access_filter
-    brand_filter = get_brand_access_filter(current_user)
-    if brand_filter is not None:
-        query = query.join(Brand).filter(brand_filter)
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found"
+        )
+
+    # Prepare brand context for AI
+    brand_context = {
+        "name": brand.name,
+        "description": brand.description,
+        "industry": brand.industry,
+        "target_audience": brand.target_audience,
+        "keywords": brand.keywords or [],
+        "style_guide": brand.style_guide or {},
+        "content_pillars": brand.content_pillars or []
+    }
+
+    # Generate content using AI
+    result = ai_generator.generate_caption(
+        brand_context=brand_context,
+        content_type=request.content_type,
+        platform=request.platform,
+        topic=request.topic,
+        additional_context=request.additional_context
+    )
+
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Content generation failed: {result['error']}"
+        )
+
+    # Save generated content to database
+    content_post = ContentPost(
+        title=f"{request.platform.title()} {request.content_type} - {datetime.now().strftime('%Y%m%d_%H%M')}",
+        caption=result["content"]["caption"],
+        content_type=PostType[request.content_type.upper()],
+        platform=Platform[request.platform.upper()],
+        brand_id=brand.id,
+        status=PostStatus.DRAFT,
+        created_by_ai=True,
+        brand_alignment_score=85.0,  # This could be calculated by AI
+        created_at=datetime.utcnow()
+    )
+
+    db.add(content_post)
+    db.commit()
+    db.refresh(content_post)
+
+    return {
+        "success": True,
+        "content_id": content_post.id,
+        "generated_content": result["content"],
+        "ai_usage": result.get("usage", {}),
+        "brand_alignment_score": content_post.brand_alignment_score
+    }
+
+@router.post("/generate/hashtags")
+async def generate_hashtags(
+    request: HashtagGenerationRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Generate relevant hashtags for content"""
+
+    # Get brand information
+    brand = db.query(Brand).filter(
+        Brand.id == request.brand_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found"
+        )
+
+    brand_context = {
+        "name": brand.name,
+        "industry": brand.industry,
+        "target_audience": brand.target_audience
+    }
+
+    hashtags = ai_generator.generate_hashtags(
+        content=request.content,
+        platform=request.platform,
+        brand_context=brand_context,
+        target_count=request.target_count
+    )
+
+    return {
+        "success": True,
+        "hashtags": hashtags,
+        "count": len(hashtags),
+        "platform": request.platform
+    }
+
+@router.post("/generate/ideas")
+async def generate_content_ideas(
+    request: ContentIdeasRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Generate content ideas for a brand"""
+
+    # Get brand information
+    brand = db.query(Brand).filter(
+        Brand.id == request.brand_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found"
+        )
+
+    brand_context = {
+        "name": brand.name,
+        "description": brand.description,
+        "industry": brand.industry,
+        "target_audience": brand.target_audience,
+        "content_pillars": brand.content_pillars or []
+    }
+
+    ideas = ai_generator.generate_content_ideas(
+        brand_context=brand_context,
+        platform=request.platform,
+        count=request.count
+    )
+
+    return {
+        "success": True,
+        "ideas": ideas,
+        "count": len(ideas),
+        "platform": request.platform,
+        "brand": brand.name
+    }
+
+@router.post("/optimize")
+async def optimize_content(
+    request: ContentOptimizationRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Optimize content for different platforms"""
+
+    # Get brand information
+    brand = db.query(Brand).filter(
+        Brand.id == request.brand_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found"
+        )
+
+    brand_context = {
+        "name": brand.name,
+        "industry": brand.industry,
+        "style_guide": brand.style_guide or {}
+    }
+
+    result = ai_generator.optimize_content_for_platform(
+        content=request.content,
+        source_platform=request.source_platform,
+        target_platform=request.target_platform,
+        brand_context=brand_context
+    )
+
+    return result
+
+@router.post("/analyze/brand-voice")
+async def analyze_brand_voice(
+    request: BrandVoiceAnalysisRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Analyze and define brand voice from sample content"""
+
+    # Get brand information
+    brand = db.query(Brand).filter(
+        Brand.id == request.brand_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found"
+        )
+
+    brand_context = {
+        "name": brand.name,
+        "industry": brand.industry
+    }
+
+    result = ai_generator.analyze_brand_voice(
+        brand_context=brand_context,
+        sample_content=request.sample_content
+    )
+
+    # Update brand with analyzed voice if successful
+    if result.get("success") and "analysis" in result:
+        brand.style_guide = brand.style_guide or {}
+        brand.style_guide.update(result["analysis"])
+        db.commit()
+
+    return result
+
+# Content Management Endpoints
+@router.get("/", response_model=List[ContentResponse])
+async def list_content(
+    brand_id: Optional[int] = None,
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 25,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List user's content with filtering options"""
+
+    # Base query for user's brands
+    query = db.query(ContentPost).join(Brand).filter(Brand.owner_id == current_user.id)
 
     # Apply filters
     if brand_id:
-        # Verify user has access to this brand
-        await verify_brand_access(brand_id, current_user, db)
         query = query.filter(ContentPost.brand_id == brand_id)
 
-    if status:
-        query = query.filter(ContentPost.status == status)
-
     if platform:
-        query = query.filter(ContentPost.platform == platform)
+        try:
+            platform_enum = Platform[platform.upper()]
+            query = query.filter(ContentPost.platform == platform_enum)
+        except KeyError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid platform: {platform}"
+            )
 
-    if content_type:
-        query = query.filter(ContentPost.content_type == content_type)
+    if status:
+        try:
+            status_enum = PostStatus[status.upper()]
+            query = query.filter(ContentPost.status == status_enum)
+        except KeyError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status: {status}"
+            )
 
-    if filters.start_date:
-        start_date = datetime.fromisoformat(filters.start_date)
-        query = query.filter(ContentPost.created_at >= start_date)
+    # Order by creation date (newest first) and apply pagination
+    content_posts = query.order_by(ContentPost.created_at.desc()).offset(offset).limit(limit).all()
 
-    if filters.end_date:
-        end_date = datetime.fromisoformat(filters.end_date)
-        query = query.filter(ContentPost.created_at <= end_date)
+    return content_posts
 
-    # Order by creation time (newest first)
-    query = query.order_by(desc(ContentPost.created_at))
-
-    # Apply pagination
-    content = query.offset(pagination.skip).limit(pagination.limit).all()
-
-    return content
-
-@router.get("/content/{content_id}", response_model=ContentResponse)
+@router.get("/{content_id}")
 async def get_content(
     content_id: int,
     current_user: User = Depends(get_current_user),
@@ -170,661 +351,268 @@ async def get_content(
 ):
     """Get specific content by ID"""
 
-    content = await validate_content_ownership(content_id, current_user, db)
-    return content
+    content_post = db.query(ContentPost).join(Brand).filter(
+        ContentPost.id == content_id,
+        Brand.owner_id == current_user.id
+    ).first()
 
-@router.post("/content", response_model=ContentResponse, status_code=status.HTTP_201_CREATED)
-async def create_content(
-    content_data: ContentCreate,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.create_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("create", "content"))
-):
-    """Create new content"""
-
-    # Verify user has access to the brand
-    brand = await verify_brand_access(content_data.brand_id, current_user, db)
-
-    # Create content post
-    content = ContentPost(
-        title=content_data.title,
-        caption=content_data.caption,
-        content_type=content_data.content_type,
-        platform=content_data.platform,
-        scheduled_time=content_data.scheduled_time,
-        image_url=content_data.image_url,
-        video_url=content_data.video_url,
-        media_description=content_data.media_description,
-        brand_id=content_data.brand_id,
-        status=PostStatus.DRAFT,
-        created_by_ai=False,
-        created_at=datetime.utcnow()
-    )
-
-    # Calculate brand alignment score
-    if brand.style_guide:
-        content.brand_alignment_score = await generator.calculate_brand_alignment_score(
-            content_data.caption, brand
+    if not content_post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found"
         )
 
-    # Set risk score based on alignment
-    if content.brand_alignment_score >= 90:
-        content.risk_score = "low"
-    elif content.brand_alignment_score >= 75:
-        content.risk_score = "medium"
-    else:
-        content.risk_score = "high"
+    return content_post
 
-    db.add(content)
-    db.commit()
-    db.refresh(content)
-
-    logger.info(f"Content created: {content.id} by user {current_user.id}")
-
-    return content
-
-@router.put("/content/{content_id}", response_model=ContentResponse)
+@router.put("/{content_id}")
 async def update_content(
     content_id: int,
-    content_update: ContentUpdate,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.edit_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("update", "content"))
+    caption: Optional[str] = None,
+    title: Optional[str] = None,
+    scheduled_time: Optional[datetime] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    """Update existing content"""
+    """Update content"""
 
-    content = await validate_content_ownership(content_id, current_user, db)
+    content_post = db.query(ContentPost).join(Brand).filter(
+        ContentPost.id == content_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not content_post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found"
+        )
 
     # Update fields
-    if content_update.title is not None:
-        content.title = content_update.title
+    if caption is not None:
+        content_post.caption = caption
 
-    if content_update.caption is not None:
-        content.caption = content_update.caption
+    if title is not None:
+        content_post.title = title
 
-        # Recalculate brand alignment if caption changed
-        brand = db.query(Brand).filter(Brand.id == content.brand_id).first()
-        if brand and brand.style_guide:
-            content.brand_alignment_score = await generator.calculate_brand_alignment_score(
-                content_update.caption, brand
-            )
+    if scheduled_time is not None:
+        content_post.scheduled_time = scheduled_time
+        if content_post.status == PostStatus.DRAFT:
+            content_post.status = PostStatus.SCHEDULED
 
-    if content_update.scheduled_time is not None:
-        content.scheduled_time = content_update.scheduled_time
-
-    if content_update.image_url is not None:
-        content.image_url = content_update.image_url
-
-    if content_update.video_url is not None:
-        content.video_url = content_update.video_url
-
-    if content_update.media_description is not None:
-        content.media_description = content_update.media_description
-
-    if content_update.status is not None:
-        old_status = content.status
-        content.status = content_update.status
-
-        # Send notifications on status change
-        if old_status != content_update.status:
-            if content_update.status == PostStatus.PENDING_REVIEW:
-                background_tasks.add_task(notifier.send_approval_request, content)
-            elif content_update.status == PostStatus.SCHEDULED:
-                # Schedule for publishing
-                background_tasks.add_task(schedule_content_publication, content)
-
-    content.updated_at = datetime.utcnow()
+    content_post.updated_at = datetime.utcnow()
     db.commit()
-    db.refresh(content)
+    db.refresh(content_post)
 
-    logger.info(f"Content updated: {content.id} by user {current_user.id}")
+    return content_post
 
-    return content
-
-@router.delete("/content/{content_id}")
+@router.delete("/{content_id}")
 async def delete_content(
-    content_id: int,
-    current_user: User = RequirePermission.delete_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("delete", "content"))
-):
-    """Delete content"""
-
-    content = await validate_content_ownership(content_id, current_user, db)
-
-    # Don't allow deletion of published content
-    if content.status == PostStatus.PUBLISHED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot delete published content"
-        )
-
-    db.delete(content)
-    db.commit()
-
-    logger.info(f"Content deleted: {content_id} by user {current_user.id}")
-
-    return {"message": "Content deleted successfully"}
-
-# AI Content Generation
-
-@router.post("/content/generate", response_model=List[ContentResponse])
-async def generate_content(
-    generate_request: ContentGenerate,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.create_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("generate", "content"))
-):
-    """Generate AI content for a brand"""
-
-    # Verify user has access to the brand
-    brand = await verify_brand_access(generate_request.brand_id, current_user, db)
-
-    try:
-        # Generate content using AI
-        if generate_request.custom_prompt:
-            # Custom content generation
-            suggestions = await generator.get_content_suggestions(brand, count=1)
-            # This would use the custom prompt - simplified for now
-            generated_content = suggestions[:1]
-        else:
-            # Standard daily content generation
-            result = await generator.generate_daily_content(brand)
-
-            if result.get("errors"):
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Content generation failed: {result['errors']}"
-                )
-
-            # Get the generated posts from database
-            generated_posts = []
-            for post_info in result.get("posts_generated", []):
-                post = db.query(ContentPost).filter(ContentPost.id == post_info["post_id"]).first()
-                if post:
-                    generated_posts.append(post)
-
-            return generated_posts
-
-    except Exception as e:
-        logger.error(f"Content generation failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Content generation failed: {str(e)}"
-        )
-
-@router.post("/content/{content_id}/regenerate", response_model=ContentResponse)
-async def regenerate_content(
-    content_id: int,
-    feedback: str = None,
-    current_user: User = RequirePermission.edit_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("regenerate", "content"))
-):
-    """Regenerate content with feedback"""
-
-    content = await validate_content_ownership(content_id, current_user, db)
-
-    if not content.created_by_ai:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can only regenerate AI-created content"
-        )
-
-    # Regenerate content
-    updated_content = await generator.regenerate_post(content_id, feedback or "")
-
-    if not updated_content:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to regenerate content"
-        )
-
-    logger.info(f"Content regenerated: {content_id} by user {current_user.id}")
-
-    return updated_content
-
-# Content Approval Workflow
-
-@router.post("/content/{content_id}/approve")
-async def approve_content(
-    content_id: int,
-    approval: ContentApproval,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.approve_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("approve", "content"))
-):
-    """Approve or reject content"""
-
-    content = await validate_content_ownership(content_id, current_user, db)
-
-    if content.status != PostStatus.PENDING_REVIEW:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Content is not pending review"
-        )
-
-    # Create review record
-    review = ContentReview(
-        post_id=content_id,
-        reviewer_id=current_user.id,
-        decision=approval.decision,
-        feedback=approval.feedback,
-        suggested_changes=approval.suggested_changes,
-        reviewed_at=datetime.utcnow()
-    )
-    db.add(review)
-
-    # Update content status
-    if approval.decision == "approve":
-        content.status = PostStatus.APPROVED
-        if content.scheduled_time:
-            content.status = PostStatus.SCHEDULED
-            background_tasks.add_task(schedule_content_publication, content)
-    elif approval.decision == "reject":
-        content.status = PostStatus.REJECTED
-    elif approval.decision == "request_changes":
-        content.status = PostStatus.DRAFT
-        # Could trigger regeneration here
-
-    content.updated_at = datetime.utcnow()
-    db.commit()
-
-    logger.info(f"Content {approval.decision}d: {content_id} by user {current_user.id}")
-
-    return {
-        "message": f"Content {approval.decision}d successfully",
-        "content_id": content_id,
-        "new_status": content.status.value
-    }
-
-@router.get("/content/{content_id}/reviews")
-async def get_content_reviews(
     content_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get review history for content"""
+    """Delete content"""
 
-    content = await validate_content_ownership(content_id, current_user, db)
+    content_post = db.query(ContentPost).join(Brand).filter(
+        ContentPost.id == content_id,
+        Brand.owner_id == current_user.id
+    ).first()
 
-    reviews = db.query(ContentReview).filter(
-        ContentReview.post_id == content_id
-    ).order_by(desc(ContentReview.reviewed_at)).all()
+    if not content_post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found"
+        )
 
-    return reviews
+    db.delete(content_post)
+    db.commit()
 
-# Content Publishing
+    return {"message": "Content deleted successfully"}
 
-@router.post("/content/{content_id}/publish")
-async def publish_content_now(
+# Social Media Posting Endpoints
+@router.post("/{content_id}/publish")
+async def publish_content(
     content_id: int,
+    social_account_id: int,
     background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.publish_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("publish", "content"))
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    """Publish content immediately"""
+    """Publish content to social media platform"""
 
-    content = await validate_content_ownership(content_id, current_user, db)
+    # Get content
+    content_post = db.query(ContentPost).join(Brand).filter(
+        ContentPost.id == content_id,
+        Brand.owner_id == current_user.id
+    ).first()
 
-    if content.status not in [PostStatus.APPROVED, PostStatus.SCHEDULED]:
+    if not content_post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found"
+        )
+
+    # Get social account
+    social_account = db.query(SocialAccount).join(Brand).filter(
+        SocialAccount.id == social_account_id,
+        Brand.owner_id == current_user.id
+    ).first()
+
+    if not social_account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Social account not found"
+        )
+
+    # Verify platform compatibility
+    if content_post.platform.value != social_account.platform.value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Content must be approved before publishing"
+            detail="Content platform doesn't match social account platform"
         )
 
-    # Publish to platform
-    background_tasks.add_task(publish_content_to_platform, content)
-
-    return {
-        "message": "Content publishing initiated",
-        "content_id": content_id
-    }
-
-async def publish_content_to_platform(content: ContentPost):
-    """Background task to publish content to social media platform"""
-    db = SessionLocal()
-    try:
-        # Prepare content data for publishing
-        content_data = {
-            "caption": content.caption,
-            "content_type": content.content_type.value,
-            "media_url": content.image_url or content.video_url
-        }
-
-        # Publish to platform
-        result = await webhook_manager.post_to_platform(
-            content.platform.value, content_data
+    # Publish immediately or schedule
+    if content_post.scheduled_time and content_post.scheduled_time > datetime.utcnow():
+        # Schedule for later
+        background_tasks.add_task(
+            _schedule_publish_task,
+            content_post,
+            social_account,
+            db
         )
+
+        content_post.status = PostStatus.SCHEDULED
+        message = f"Content scheduled for {content_post.scheduled_time}"
+    else:
+        # Publish now
+        result = await _publish_to_platform(content_post, social_account)
 
         if result.get("success"):
-            # Update content status
-            content.status = PostStatus.PUBLISHED
-            content.published_time = datetime.utcnow()
-
-            # Send success notification
-            await notifier.send_post_published_notification(content, result)
+            content_post.status = PostStatus.PUBLISHED
+            content_post.published_time = datetime.utcnow()
+            message = "Content published successfully"
         else:
-            # Handle failure
-            content.retry_count += 1
-            content.error_message = result.get("error", "Unknown error")
-
-            if content.retry_count >= 3:
-                content.status = PostStatus.FAILED
-                await notifier.send_post_failed_notification(content)
-
-        db.commit()
-
-    except Exception as e:
-        logger.error(f"Error publishing content {content.id}: {e}")
-        content.retry_count += 1
-        content.error_message = str(e)
-
-        if content.retry_count >= 3:
-            content.status = PostStatus.FAILED
-            await notifier.send_post_failed_notification(content)
-
-        db.commit()
-    finally:
-        db.close()
-
-async def schedule_content_publication(content: ContentPost):
-    """Background task to schedule content for future publication"""
-    # This would integrate with APScheduler or similar
-    logger.info(f"Scheduled content {content.id} for publication at {content.scheduled_time}")
-
-# Bulk Operations
-
-@router.post("/content/bulk-action")
-async def bulk_content_action(
-    bulk_action: BulkAction,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.edit_content,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("bulk_action", "content"))
-):
-    """Perform bulk action on multiple content items"""
-
-    # Validate all content IDs belong to user's accessible brands
-    content_items = []
-    for content_id in bulk_action.content_ids:
-        content = await validate_content_ownership(content_id, current_user, db)
-        content_items.append(content)
-
-    results = []
-
-    for content in content_items:
-        try:
-            if bulk_action.action == "approve":
-                if current_user.role not in ["admin", "manager"]:
-                    results.append({"content_id": content.id, "success": False, "error": "Insufficient permissions"})
-                    continue
-
-                content.status = PostStatus.APPROVED
-                if content.scheduled_time:
-                    content.status = PostStatus.SCHEDULED
-                    background_tasks.add_task(schedule_content_publication, content)
-
-            elif bulk_action.action == "reject":
-                if current_user.role not in ["admin", "manager"]:
-                    results.append({"content_id": content.id, "success": False, "error": "Insufficient permissions"})
-                    continue
-
-                content.status = PostStatus.REJECTED
-
-            elif bulk_action.action == "delete":
-                if content.status == PostStatus.PUBLISHED:
-                    results.append({"content_id": content.id, "success": False, "error": "Cannot delete published content"})
-                    continue
-
-                db.delete(content)
-
-            elif bulk_action.action == "schedule":
-                if not bulk_action.scheduled_time:
-                    results.append({"content_id": content.id, "success": False, "error": "Scheduled time required"})
-                    continue
-
-                content.scheduled_time = bulk_action.scheduled_time
-                if content.status == PostStatus.APPROVED:
-                    content.status = PostStatus.SCHEDULED
-                    background_tasks.add_task(schedule_content_publication, content)
-
-            elif bulk_action.action == "publish":
-                if content.status not in [PostStatus.APPROVED, PostStatus.SCHEDULED]:
-                    results.append({"content_id": content.id, "success": False, "error": "Content must be approved"})
-                    continue
-
-                background_tasks.add_task(publish_content_to_platform, content)
-
-            content.updated_at = datetime.utcnow()
-            results.append({"content_id": content.id, "success": True})
-
-        except Exception as e:
-            results.append({"content_id": content.id, "success": False, "error": str(e)})
+            content_post.status = PostStatus.FAILED
+            content_post.error_message = result.get("error", "Unknown error")
+            message = f"Publishing failed: {result.get('error')}"
 
     db.commit()
 
-    logger.info(f"Bulk action {bulk_action.action} performed on {len(bulk_action.content_ids)} items by user {current_user.id}")
-
     return {
-        "action": bulk_action.action,
-        "total_items": len(bulk_action.content_ids),
-        "successful": len([r for r in results if r["success"]]),
-        "failed": len([r for r in results if not r["success"]]),
-        "results": results
+        "success": content_post.status == PostStatus.PUBLISHED or content_post.status == PostStatus.SCHEDULED,
+        "message": message,
+        "status": content_post.status.value,
+        "content_id": content_post.id
     }
 
-# Content Discovery & Scraping
+async def _publish_to_platform(content_post: ContentPost, social_account: SocialAccount) -> Dict:
+    """Publish content to specific social media platform"""
 
-@router.post("/content/scrape")
-async def scrape_content(
-    scraping_request: ScrapingRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = RequirePermission.view_brands,
-    db: Session = Depends(get_db),
-    _audit: dict = Depends(audit_log("scrape", "content"))
-):
-    """Scrape trending content for brand inspiration"""
+    platform = social_account.platform.value
+    caption = content_post.caption
+    access_token = social_account.access_token
 
-    # Verify user has access to the brand
-    brand = await verify_brand_access(scraping_request.brand_id, current_user, db)
+    if platform == "instagram":
+        if content_post.image_url:
+            return instagram_api.post_photo(
+                access_token=access_token,
+                image_url=content_post.image_url,
+                caption=caption
+            )
+        else:
+            return {"error": "Instagram requires image for posts"}
 
-    # Start background scraping task
-    background_tasks.add_task(
-        run_content_scraping,
-        brand,
-        scraping_request.keywords or brand.keywords,
-        scraping_request.platforms,
-        scraping_request.limit
-    )
+    elif platform == "twitter":
+        if content_post.image_url:
+            return twitter_api.post_tweet_with_media(
+                text=caption,
+                media_url=content_post.image_url
+            )
+        else:
+            return twitter_api.post_tweet(caption)
 
-    return {
-        "message": "Content scraping initiated",
-        "brand_id": scraping_request.brand_id,
-        "estimated_completion": "2-5 minutes"
-    }
+    elif platform == "facebook":
+        return facebook_api.post_to_page(
+            page_id=social_account.username,  # Assuming username stores page ID
+            page_access_token=access_token,
+            message=caption,
+            image_url=content_post.image_url
+        )
 
-async def run_content_scraping(brand: Brand, keywords: List[str], platforms: List[str], limit: int):
-    """Background task for content scraping"""
-    try:
-        result = await scraper.scrape_for_brand(brand)
-        logger.info(f"Content scraping completed for brand {brand.id}: {result.get('total_scraped', 0)} items")
-    except Exception as e:
-        logger.error(f"Content scraping failed for brand {brand.id}: {e}")
+    elif platform == "linkedin":
+        return linkedin_api.post_to_profile(
+            access_token=access_token,
+            text=caption,
+            image_url=content_post.image_url
+        )
 
-@router.get("/content/scraped")
-async def get_scraped_content(
-    brand_id: int,
-    pagination: PaginationParams = Depends(get_pagination_params),
-    min_relevance: float = Query(70.0, ge=0.0, le=100.0),
-    platform: Optional[str] = Query(None),
-    current_user: User = RequirePermission.view_brands,
-    db: Session = Depends(get_db)
-):
-    """Get scraped content for inspiration"""
+    else:
+        return {"error": f"Unsupported platform: {platform}"}
 
-    # Verify user has access to the brand
-    await verify_brand_access(brand_id, current_user, db)
+def _schedule_publish_task(content_post: ContentPost, social_account: SocialAccount, db: Session):
+    """Background task for scheduled publishing"""
+    # In a real implementation, this would be handled by a task queue like Celery
+    # For now, this is a placeholder for the scheduling logic
+    logger.info(f"Scheduled publishing task created for content {content_post.id}")
 
-    query = db.query(ScrapedContent).filter(
-        ScrapedContent.brand_id == brand_id,
-        ScrapedContent.relevance_score >= min_relevance
-    )
-
-    if platform:
-        query = query.filter(ScrapedContent.platform == platform)
-
-    query = query.order_by(desc(ScrapedContent.relevance_score), desc(ScrapedContent.scraped_at))
-
-    scraped_content = query.offset(pagination.skip).limit(pagination.limit).all()
-
-    return scraped_content
-
-# Analytics & Insights
-
-@router.get("/content/analytics")
+# Analytics Endpoints
+@router.get("/{content_id}/analytics")
 async def get_content_analytics(
-    brand_id: Optional[int] = Query(None),
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None),
-    platform: Optional[Platform] = Query(None),
-    current_user: User = RequirePermission.view_analytics,
+    content_id: int,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get content performance analytics"""
+    """Get analytics for published content"""
 
-    query = db.query(ContentPost).filter(ContentPost.status == PostStatus.PUBLISHED)
+    content_post = db.query(ContentPost).join(Brand).filter(
+        ContentPost.id == content_id,
+        Brand.owner_id == current_user.id
+    ).first()
 
-    # Apply brand access filter
-    from api.dependencies import get_brand_access_filter
-    brand_filter = get_brand_access_filter(current_user)
-    if brand_filter is not None:
-        query = query.join(Brand).filter(brand_filter)
+    if not content_post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found"
+        )
 
-    if brand_id:
-        await verify_brand_access(brand_id, current_user, db)
-        query = query.filter(ContentPost.brand_id == brand_id)
+    if content_post.status != PostStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Analytics only available for published content"
+        )
 
-    if platform:
-        query = query.filter(ContentPost.platform == platform)
-
-    if start_date:
-        start = datetime.fromisoformat(start_date)
-        query = query.filter(ContentPost.published_time >= start)
-
-    if end_date:
-        end = datetime.fromisoformat(end_date)
-        query = query.filter(ContentPost.published_time <= end)
-
-    posts = query.all()
-
-    # Calculate analytics
-    total_posts = len(posts)
-    total_likes = sum(post.likes_count for post in posts)
-    total_comments = sum(post.comments_count for post in posts)
-    total_shares = sum(post.shares_count for post in posts)
-    total_reach = sum(post.reach for post in posts)
-
-    avg_engagement_rate = sum(post.actual_engagement_rate for post in posts) / total_posts if total_posts > 0 else 0
-
-    # Platform breakdown
-    platform_stats = {}
-    for post in posts:
-        platform_name = post.platform.value
-        if platform_name not in platform_stats:
-            platform_stats[platform_name] = {
-                "posts": 0,
-                "likes": 0,
-                "comments": 0,
-                "shares": 0,
-                "reach": 0
-            }
-
-        platform_stats[platform_name]["posts"] += 1
-        platform_stats[platform_name]["likes"] += post.likes_count
-        platform_stats[platform_name]["comments"] += post.comments_count
-        platform_stats[platform_name]["shares"] += post.shares_count
-        platform_stats[platform_name]["reach"] += post.reach
-
-    # Content type performance
-    content_type_stats = {}
-    for post in posts:
-        content_type = post.content_type.value
-        if content_type not in content_type_stats:
-            content_type_stats[content_type] = {
-                "posts": 0,
-                "avg_engagement": 0,
-                "total_engagement": 0
-            }
-
-        content_type_stats[content_type]["posts"] += 1
-        content_type_stats[content_type]["total_engagement"] += post.actual_engagement_rate
-
-    # Calculate averages
-    for content_type in content_type_stats:
-        posts_count = content_type_stats[content_type]["posts"]
-        if posts_count > 0:
-            content_type_stats[content_type]["avg_engagement"] = content_type_stats[content_type]["total_engagement"] / posts_count
-
-    return {
-        "summary": {
-            "total_posts": total_posts,
-            "total_likes": total_likes,
-            "total_comments": total_comments,
-            "total_shares": total_shares,
-            "total_reach": total_reach,
-            "avg_engagement_rate": round(avg_engagement_rate, 2)
+    # Return stored analytics data
+    analytics = {
+        "content_id": content_post.id,
+        "platform": content_post.platform.value,
+        "published_time": content_post.published_time,
+        "engagement": {
+            "likes": content_post.likes_count,
+            "comments": content_post.comments_count,
+            "shares": content_post.shares_count,
+            "reach": content_post.reach,
+            "impressions": content_post.impressions
         },
-        "platform_breakdown": platform_stats,
-        "content_type_performance": content_type_stats,
-        "period": {
-            "start_date": start_date,
-            "end_date": end_date
-        }
+        "engagement_rate": content_post.actual_engagement_rate,
+        "brand_alignment_score": content_post.brand_alignment_score
     }
 
-@router.get("/content/queue-status")
-async def get_queue_status(
-    current_user: User = RequirePermission.view_brands,
-    db: Session = Depends(get_db)
-):
-    """Get status of content queue"""
+    return analytics
 
-    # Apply brand access filter
-    from api.dependencies import get_brand_access_filter
-    brand_filter = get_brand_access_filter(current_user)
+# Platform Health Checks
+@router.get("/platforms/status")
+async def get_platforms_status():
+    """Get status of all social media platform integrations"""
 
-    query = db.query(ContentPost)
-    if brand_filter is not None:
-        query = query.join(Brand).filter(brand_filter)
-
-    # Count by status
-    status_counts = {}
-    for status in PostStatus:
-        count = query.filter(ContentPost.status == status).count()
-        status_counts[status.value] = count
-
-    # Upcoming scheduled posts
-    upcoming_posts = query.filter(
-        ContentPost.status == PostStatus.SCHEDULED,
-        ContentPost.scheduled_time >= datetime.utcnow(),
-        ContentPost.scheduled_time <= datetime.utcnow() + timedelta(days=7)
-    ).order_by(ContentPost.scheduled_time).limit(10).all()
-
-    # Pending approvals nearing deadline
-    urgent_approvals = query.filter(
-        ContentPost.status == PostStatus.PENDING_REVIEW,
-        ContentPost.scheduled_time <= datetime.utcnow() + timedelta(hours=4)
-    ).order_by(ContentPost.scheduled_time).all()
+    status_checks = {
+        "instagram": instagram_api.is_configured(),
+        "twitter": twitter_api.is_configured(),
+        "facebook": facebook_api.is_configured(),
+        "linkedin": linkedin_api.is_configured() if 'linkedin_api' in globals() else False,
+        "ai_generator": ai_generator._is_configured()
+    }
 
     return {
-        "status_counts": status_counts,
-        "upcoming_posts": len(upcoming_posts),
-        "urgent_approvals": len(urgent_approvals),
-        "next_scheduled": upcoming_posts[0].scheduled_time.isoformat() if upcoming_posts else None
+        "platforms": status_checks,
+        "all_configured": all(status_checks.values()),
+        "configured_count": sum(status_checks.values())
     }
